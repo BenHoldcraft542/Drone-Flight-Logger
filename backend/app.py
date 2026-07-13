@@ -13,11 +13,15 @@ Run:
 Then open http://localhost:8000
 """
 
+import os
+import secrets
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import List, Optional
 
-from fastapi import FastAPI, HTTPException
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -26,6 +30,26 @@ from pydantic import BaseModel
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR.parent / "database" / "flights.db"
 FRONTEND_DIR = BASE_DIR.parent / "frontend"
+
+load_dotenv(BASE_DIR / ".env")  # loads INGEST_API_KEY (and anything else) from backend/.env
+
+# API key for write access (the ESP32's upload endpoint). Set this via an
+# environment variable rather than hardcoding it -- see README for setup.
+# If INGEST_API_KEY isn't set, the server refuses to start rather than
+# silently running unprotected.
+INGEST_API_KEY = os.environ.get("INGEST_API_KEY")
+if not INGEST_API_KEY:
+    raise RuntimeError(
+        "INGEST_API_KEY environment variable is not set. "
+        "Generate one (e.g. `python3 -c \"import secrets; print(secrets.token_hex(32))\"`) "
+        "and set it before starting the server. See README.md."
+    )
+
+
+def verify_api_key(x_api_key: Optional[str] = Header(default=None)):
+    if not x_api_key or not secrets.compare_digest(x_api_key, INGEST_API_KEY):
+        raise HTTPException(status_code=401, detail="Missing or invalid API key")
+
 
 app = FastAPI(title="Drone Flight Logger API")
 
@@ -105,21 +129,21 @@ class TelemetryPoint(BaseModel):
     ms: int
     lat: float
     lon: float
-    alt: float | None = None
-    sats: int | None = None
-    hdop: float | None = None
-    roll: float | None = None
-    pitch: float | None = None
-    yaw: float | None = None
+    alt: Optional[float] = None
+    sats: Optional[int] = None
+    hdop: Optional[float] = None
+    roll: Optional[float] = None
+    pitch: Optional[float] = None
+    yaw: Optional[float] = None
 
 
 class FlightUpload(BaseModel):
     drone_name: str
     upload_time: str  # ISO 8601 UTC, e.g. "2026-07-12T20:15:00Z"
-    points: list[TelemetryPoint]
+    points: List[TelemetryPoint]
 
 
-@app.post("/api/ingest/flight", status_code=201)
+@app.post("/api/ingest/flight", status_code=201, dependencies=[Depends(verify_api_key)])
 def ingest_flight(upload: FlightUpload):
     if not upload.points:
         raise HTTPException(status_code=400, detail="No points in upload")
