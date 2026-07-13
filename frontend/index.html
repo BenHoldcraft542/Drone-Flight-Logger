@@ -1,0 +1,549 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Drone Flight Logger</title>
+
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+<style>
+  :root {
+    --bg: #0B0E14;
+    --panel: #10151E;
+    --panel-border: #212B3A;
+    --grid: #182131;
+    --cyan: #4FD8E8;
+    --amber: #E8A23D;
+    --text: #E6EDF3;
+    --text-muted: #64707F;
+    --danger: #E85D5D;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Inter', sans-serif;
+    overflow: hidden;
+  }
+
+  .mono { font-family: 'JetBrains Mono', monospace; }
+
+  #app {
+    display: grid;
+    grid-template-rows: 56px 1fr 64px;
+    height: 100vh;
+  }
+
+  /* ---- Header ---- */
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 18px;
+    border-bottom: 1px solid var(--panel-border);
+    background: var(--panel);
+  }
+
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    font-size: 14px;
+    text-transform: uppercase;
+  }
+  .brand .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--text-muted);
+  }
+  .brand .dot.live { background: var(--cyan); box-shadow: 0 0 8px var(--cyan); }
+
+  header select {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--panel-border);
+    border-radius: 4px;
+    padding: 6px 10px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+  }
+
+  .view-toggle {
+    display: flex;
+    border: 1px solid var(--panel-border);
+    border-radius: 4px;
+    overflow: hidden;
+  }
+  .view-toggle button {
+    background: var(--bg);
+    color: var(--text-muted);
+    border: none;
+    padding: 6px 14px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    letter-spacing: 0.05em;
+    cursor: pointer;
+  }
+  .view-toggle button.active {
+    background: var(--cyan);
+    color: #06181B;
+    font-weight: 700;
+  }
+
+  /* ---- Main grid: alt tape | center view | speed tape+status ---- */
+  main {
+    display: grid;
+    grid-template-columns: 84px 1fr 220px;
+    overflow: hidden;
+  }
+
+  .tape-panel {
+    background: var(--panel);
+    border-right: 1px solid var(--panel-border);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 10px 0;
+  }
+  main > .tape-panel:last-of-type { border-right: none; border-left: 1px solid var(--panel-border); }
+
+  .tape-label {
+    font-size: 10px;
+    color: var(--text-muted);
+    letter-spacing: 0.08em;
+    margin-bottom: 6px;
+  }
+  .tape-value {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 20px;
+    font-weight: 700;
+    color: var(--cyan);
+  }
+  .tape-unit {
+    font-size: 10px;
+    color: var(--text-muted);
+    margin-bottom: 14px;
+  }
+  .tape-bar-wrap {
+    flex: 1;
+    width: 26px;
+    background: var(--grid);
+    border-radius: 4px;
+    position: relative;
+    overflow: hidden;
+  }
+  .tape-bar-fill {
+    position: absolute;
+    bottom: 0; left: 0; right: 0;
+    background: linear-gradient(180deg, var(--cyan), #1c7d8a);
+    transition: height 0.15s linear;
+  }
+
+  #center {
+    position: relative;
+    background: #060809;
+  }
+  #map2d, #view3d {
+    position: absolute;
+    inset: 0;
+  }
+  #view3d { display: none; }
+  #view3d canvas { display: block; }
+
+  .status-panel {
+    background: var(--panel);
+    padding: 14px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    overflow-y: auto;
+  }
+  .status-block .label {
+    font-size: 10px;
+    color: var(--text-muted);
+    letter-spacing: 0.08em;
+    margin-bottom: 4px;
+  }
+  .status-block .value {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 16px;
+    color: var(--text);
+  }
+  .status-block .value.warn { color: var(--amber); }
+  .status-block .value.bad { color: var(--danger); }
+
+  /* Attitude indicator */
+  #attitude {
+    width: 100%;
+    aspect-ratio: 1;
+    border-radius: 50%;
+    border: 1px solid var(--panel-border);
+    position: relative;
+    overflow: hidden;
+    background: #06181B;
+  }
+  #attitude-sky {
+    position: absolute;
+    width: 200%; height: 200%;
+    left: -50%; top: -50%;
+    background: linear-gradient(180deg, #1c4a5e 0%, #1c4a5e 50%, #3a2a1a 50%, #3a2a1a 100%);
+    transform-origin: center center;
+  }
+  #attitude-crosshair {
+    position: absolute;
+    left: 50%; top: 50%;
+    width: 60%; height: 2px;
+    background: var(--cyan);
+    transform: translate(-50%, -50%);
+  }
+
+  /* Empty state */
+  #empty-state {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-direction: column;
+    gap: 10px;
+    color: var(--text-muted);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+    text-align: center;
+    padding: 0 20px;
+  }
+
+  /* ---- Timeline scrubber ---- */
+  footer {
+    background: var(--panel);
+    border-top: 1px solid var(--panel-border);
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 0 18px;
+  }
+  #playBtn {
+    background: var(--cyan);
+    color: #06181B;
+    border: none;
+    width: 34px; height: 34px;
+    border-radius: 50%;
+    cursor: pointer;
+    font-size: 14px;
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0;
+  }
+  #timeline {
+    flex: 1;
+    accent-color: var(--cyan);
+  }
+  #timeLabel {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    color: var(--text-muted);
+    width: 160px;
+    text-align: right;
+    flex-shrink: 0;
+  }
+
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-thumb { background: var(--panel-border); border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<div id="app">
+  <header>
+    <div class="brand"><span class="dot" id="statusDot"></span> Drone Flight Logger</div>
+    <select id="flightSelect">
+      <option value="">Loading flights…</option>
+    </select>
+    <div class="view-toggle">
+      <button id="btn2d" class="active">2D MAP</button>
+      <button id="btn3d">3D VIEW</button>
+    </div>
+  </header>
+
+  <main>
+    <div class="tape-panel">
+      <div class="tape-label">ALT</div>
+      <div class="tape-value mono" id="altValue">--</div>
+      <div class="tape-unit">m</div>
+      <div class="tape-bar-wrap"><div class="tape-bar-fill" id="altBar" style="height:0%"></div></div>
+    </div>
+
+    <div id="center">
+      <div id="map2d"></div>
+      <div id="view3d"></div>
+      <div id="empty-state">
+        <div>NO FLIGHT SELECTED</div>
+        <div style="opacity:0.6">Fly, land, and let the ESP32 sync over WiFi —<br>then pick a flight above.</div>
+      </div>
+    </div>
+
+    <div class="tape-panel">
+      <div class="tape-label">SPD</div>
+      <div class="tape-value mono" id="spdValue">--</div>
+      <div class="tape-unit">m/s</div>
+      <div class="tape-bar-wrap"><div class="tape-bar-fill" id="spdBar" style="height:0%"></div></div>
+    </div>
+
+    <div class="status-panel">
+      <div class="status-block">
+        <div class="label">ATTITUDE</div>
+        <div id="attitude">
+          <div id="attitude-sky"></div>
+          <div id="attitude-crosshair"></div>
+        </div>
+      </div>
+      <div class="status-block">
+        <div class="label">HEADING</div>
+        <div class="value mono" id="hdgValue">--°</div>
+      </div>
+      <div class="status-block">
+        <div class="label">GPS FIX</div>
+        <div class="value mono" id="gpsValue">--</div>
+      </div>
+      <div class="status-block">
+        <div class="label">SATELLITES</div>
+        <div class="value mono" id="satValue">--</div>
+      </div>
+      <div class="status-block">
+        <div class="label">BATTERY</div>
+        <div class="value mono" id="battValue">--</div>
+      </div>
+      <div class="status-block">
+        <div class="label">POSITION</div>
+        <div class="value mono" id="posValue" style="font-size:12px;">--</div>
+      </div>
+    </div>
+  </main>
+
+  <footer>
+    <button id="playBtn">▶</button>
+    <input type="range" id="timeline" min="0" max="0" value="0" />
+    <div id="timeLabel" class="mono">--</div>
+  </footer>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/three@0.160.0/build/three.min.js"></script>
+<script src="https://unpkg.com/three@0.160.0/examples/js/controls/OrbitControls.js"></script>
+
+<script>
+const API = ""; // same origin
+
+let telemetry = [];
+let currentIndex = 0;
+let playing = false;
+let playTimer = null;
+
+// ---------- Flight selector ----------
+async function loadFlights() {
+  const res = await fetch(`${API}/api/flights`);
+  const flights = await res.json();
+  const sel = document.getElementById("flightSelect");
+  sel.innerHTML = "";
+  if (flights.length === 0) {
+    sel.innerHTML = `<option value="">No flights logged yet</option>`;
+    return;
+  }
+  sel.innerHTML = `<option value="">Select a flight…</option>` + flights.map(f =>
+    `<option value="${f.id}">${f.drone_name} — ${new Date(f.started_at).toLocaleString()} (${f.point_count} pts)</option>`
+  ).join("");
+  sel.onchange = () => sel.value && loadFlight(sel.value);
+}
+
+async function loadFlight(id) {
+  const res = await fetch(`${API}/api/flights/${id}/telemetry`);
+  if (!res.ok) { telemetry = []; return; }
+  telemetry = await res.json();
+  document.getElementById("empty-state").style.display = "none";
+  currentIndex = 0;
+  document.getElementById("timeline").max = telemetry.length - 1;
+  document.getElementById("timeline").value = 0;
+  buildMapPath();
+  buildScenePath();
+  renderFrame(0);
+}
+
+// ---------- 2D map (Leaflet) ----------
+let map, pathLine, marker2d;
+
+function initMap() {
+  map = L.map('map2d', { zoomControl: true, attributionControl: false }).setView([0, 0], 2);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 20 }).addTo(map);
+}
+
+function buildMapPath() {
+  if (pathLine) map.removeLayer(pathLine);
+  if (marker2d) map.removeLayer(marker2d);
+  const latlngs = telemetry.map(p => [p.lat, p.lon]);
+  pathLine = L.polyline(latlngs, { color: '#4FD8E8', weight: 3 }).addTo(map);
+  marker2d = L.circleMarker(latlngs[0], { radius: 6, color: '#E8A23D', fillColor: '#E8A23D', fillOpacity: 1 }).addTo(map);
+  map.fitBounds(pathLine.getBounds(), { padding: [30, 30] });
+}
+
+// ---------- 3D view (Three.js) ----------
+let scene, camera, renderer, controls, pathLine3d, marker3d, origin;
+
+function initScene() {
+  const el = document.getElementById("view3d");
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x060809);
+
+  camera = new THREE.PerspectiveCamera(60, el.clientWidth / el.clientHeight, 0.1, 100000);
+  camera.position.set(50, 50, 50);
+
+  renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setSize(el.clientWidth, el.clientHeight);
+  el.appendChild(renderer.domElement);
+
+  controls = new THREE.OrbitControls(camera, renderer.domElement);
+
+  const grid = new THREE.GridHelper(400, 40, 0x212B3A, 0x182131);
+  scene.add(grid);
+  scene.add(new THREE.AmbientLight(0xffffff, 1));
+
+  window.addEventListener("resize", () => {
+    camera.aspect = el.clientWidth / el.clientHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(el.clientWidth, el.clientHeight);
+  });
+
+  animate();
+}
+
+function animate() {
+  requestAnimationFrame(animate);
+  if (controls) controls.update();
+  if (renderer && scene && camera) renderer.render(scene, camera);
+}
+
+// Convert lat/lon/alt to a local flat ENU frame relative to the first point
+function toLocalXYZ(lat, lon, alt, refLat, refLon) {
+  const R = 6371000;
+  const dLat = (lat - refLat) * Math.PI / 180;
+  const dLon = (lon - refLon) * Math.PI / 180;
+  const x = dLon * R * Math.cos(refLat * Math.PI / 180); // east
+  const z = -dLat * R;                                    // north (negated for three.js -z forward)
+  const y = alt || 0;                                      // up
+  return new THREE.Vector3(x, y, z);
+}
+
+function buildScenePath() {
+  if (pathLine3d) scene.remove(pathLine3d);
+  if (marker3d) scene.remove(marker3d);
+
+  const refLat = telemetry[0].lat, refLon = telemetry[0].lon;
+  const points = telemetry.map(p => toLocalXYZ(p.lat, p.lon, p.alt_rel || 0, refLat, refLon));
+
+  const geom = new THREE.BufferGeometry().setFromPoints(points);
+  const mat = new THREE.LineBasicMaterial({ color: 0x4FD8E8 });
+  pathLine3d = new THREE.Line(geom, mat);
+  scene.add(pathLine3d);
+
+  const markerGeom = new THREE.SphereGeometry(1.2, 16, 16);
+  const markerMat = new THREE.MeshBasicMaterial({ color: 0xE8A23D });
+  marker3d = new THREE.Mesh(markerGeom, markerMat);
+  scene.add(marker3d);
+
+  // Frame the camera around the path's bounding box
+  const box = new THREE.Box3().setFromPoints(points);
+  const size = box.getSize(new THREE.Vector3());
+  const center = box.getCenter(new THREE.Vector3());
+  const dist = Math.max(size.x, size.y, size.z, 20) * 1.6;
+  camera.position.set(center.x + dist, center.y + dist * 0.6, center.z + dist);
+  controls.target.copy(center);
+}
+
+// ---------- Frame rendering (shared by scrubber + playback) ----------
+function renderFrame(i) {
+  if (!telemetry[i]) return;
+  const p = telemetry[i];
+  currentIndex = i;
+
+  document.getElementById("altValue").textContent = (p.alt_rel ?? 0).toFixed(1);
+  document.getElementById("altBar").style.height = Math.min(100, Math.max(0, (p.alt_rel || 0) / 1.2)) + "%";
+
+  document.getElementById("spdValue").textContent = (p.groundspeed ?? 0).toFixed(1);
+  document.getElementById("spdBar").style.height = Math.min(100, (p.groundspeed || 0) * 5) + "%";
+
+  document.getElementById("hdgValue").textContent = (p.yaw != null ? p.yaw.toFixed(0) : "--") + "°";
+  document.getElementById("gpsValue").textContent = fixTypeLabel(p.fix_type);
+  document.getElementById("satValue").textContent = p.satellites_visible ?? "--";
+  document.getElementById("battValue").textContent = p.battery_remaining != null ? p.battery_remaining + "%" : "--";
+  document.getElementById("posValue").textContent = `${p.lat.toFixed(6)}, ${p.lon.toFixed(6)}`;
+  document.getElementById("timeLabel").textContent = new Date(p.ts).toLocaleTimeString();
+
+  const roll = p.roll || 0, pitch = p.pitch || 0;
+  document.getElementById("attitude-sky").style.transform =
+    `translateY(${pitch * 1.5}px) rotate(${-roll}deg)`;
+
+  if (marker2d) marker2d.setLatLng([p.lat, p.lon]);
+  if (marker3d && telemetry.length) {
+    const refLat = telemetry[0].lat, refLon = telemetry[0].lon;
+    const pos = toLocalXYZ(p.lat, p.lon, p.alt_rel || 0, refLat, refLon);
+    marker3d.position.copy(pos);
+  }
+
+  document.getElementById("timeline").value = i;
+}
+
+function fixTypeLabel(ft) {
+  if (ft == null) return "--";
+  return { 0: "NO FIX", 1: "NO FIX", 2: "2D", 3: "3D" }[ft] || `TYPE ${ft}`;
+}
+
+// ---------- Controls ----------
+document.getElementById("timeline").addEventListener("input", e => {
+  stopPlayback();
+  renderFrame(parseInt(e.target.value));
+});
+
+document.getElementById("playBtn").addEventListener("click", () => {
+  playing ? stopPlayback() : startPlayback();
+});
+
+function startPlayback() {
+  if (telemetry.length === 0) return;
+  playing = true;
+  document.getElementById("playBtn").textContent = "❚❚";
+  playTimer = setInterval(() => {
+    if (currentIndex >= telemetry.length - 1) { stopPlayback(); return; }
+    renderFrame(currentIndex + 1);
+  }, 100);
+}
+function stopPlayback() {
+  playing = false;
+  document.getElementById("playBtn").textContent = "▶";
+  clearInterval(playTimer);
+}
+
+document.getElementById("btn2d").addEventListener("click", () => switchView("2d"));
+document.getElementById("btn3d").addEventListener("click", () => switchView("3d"));
+
+function switchView(mode) {
+  document.getElementById("map2d").style.display = mode === "2d" ? "block" : "none";
+  document.getElementById("view3d").style.display = mode === "3d" ? "block" : "none";
+  document.getElementById("btn2d").classList.toggle("active", mode === "2d");
+  document.getElementById("btn3d").classList.toggle("active", mode === "3d");
+  if (mode === "2d" && map) setTimeout(() => map.invalidateSize(), 50);
+}
+
+// ---------- Init ----------
+initMap();
+initScene();
+loadFlights();
+</script>
+
+</body>
+</html>
