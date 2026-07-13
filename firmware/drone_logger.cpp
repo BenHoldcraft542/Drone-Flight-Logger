@@ -28,19 +28,18 @@
   server schema already has columns for them.
 */
 
-#include <Arduino.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <LittleFS.h>
 #include <TinyGPSPlus.h>
 #include <ArduinoJson.h>
 #include <time.h>
+#include "secrets.h"  // WIFI_SSID, WIFI_PASSWORD, SERVER_URL, API_KEY, DRONE_NAME
+                       // -- copy secrets.h.example to secrets.h and fill in your values
 
-// ---------- CONFIG: edit these ----------
-const char* WIFI_SSID     = "YOUR_WIFI_NAME";
-const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
-const char* SERVER_URL    = "http://192.168.1.50:8000/api/ingest/flight"; // your logging computer's IP
-const char* DRONE_NAME    = "ESP32-Drone-1";
+// ---------- CONFIG ----------
+// Credentials live in secrets.h (gitignored). Only non-sensitive tuning
+// knobs stay here.
 const unsigned long WIFI_CONNECT_TIMEOUT_MS = 8000;   // how long to try WiFi on boot
 const unsigned long GPS_MIN_INTERVAL_MS     = 200;    // max ~5 samples/sec
 // -----------------------------------------
@@ -174,6 +173,7 @@ void uploadPendingFlight() {
   HTTPClient http;
   http.begin(SERVER_URL);
   http.addHeader("Content-Type", "application/json");
+  http.addHeader("X-API-Key", API_KEY);
   int status = http.POST(body);
 
   if (status == 200 || status == 201) {
