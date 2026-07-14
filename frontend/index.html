@@ -324,6 +324,10 @@
         <div class="label">POSITION</div>
         <div class="value mono" id="posValue" style="font-size:12px;">--</div>
       </div>
+      <div class="status-block">
+        <div class="label">VIBRATION (IMU)</div>
+        <div class="value mono" id="vibValue">--</div>
+      </div>
     </div>
   </main>
 
@@ -342,6 +346,7 @@
 const API = ""; // same origin
 
 let telemetry = [];
+let imuData = [];   // may stay empty -- not every flight source (e.g. MAVLink) logs raw IMU
 let currentIndex = 0;
 let playing = false;
 let playTimer = null;
@@ -366,6 +371,18 @@ async function loadFlight(id) {
   const res = await fetch(`${API}/api/flights/${id}/telemetry`);
   if (!res.ok) { telemetry = []; return; }
   telemetry = await res.json();
+
+  // IMU data is optional -- older flights, or ones logged via
+  // mavlink_logger.py instead of the ESP32, won't have any. A 404 here is
+  // expected and not an error state.
+  try {
+    const imuRes = await fetch(`${API}/api/flights/${id}/imu`);
+    imuData = imuRes.ok ? await imuRes.json() : [];
+  } catch {
+    imuData = [];
+  }
+  document.getElementById("vibValue").textContent = imuData.length ? "--" : "NO IMU DATA";
+
   document.getElementById("empty-state").style.display = "none";
   currentIndex = 0;
   document.getElementById("timeline").max = telemetry.length - 1;
@@ -373,6 +390,20 @@ async function loadFlight(id) {
   buildMapPath();
   buildScenePath();
   renderFrame(0);
+}
+
+// Find the IMU sample closest in time to a given GPS point's timestamp.
+// imuData is sorted by ts (ORDER BY ts ASC from the API), so binary search.
+function findNearestImu(ts) {
+  if (imuData.length === 0) return null;
+  const target = new Date(ts).getTime();
+  let lo = 0, hi = imuData.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (new Date(imuData[mid].ts).getTime() < target) lo = mid + 1;
+    else hi = mid;
+  }
+  return imuData[lo];
 }
 
 // ---------- 2D map (Leaflet) ----------
@@ -483,6 +514,18 @@ function renderFrame(i) {
   document.getElementById("battValue").textContent = p.battery_remaining != null ? p.battery_remaining + "%" : "--";
   document.getElementById("posValue").textContent = `${p.lat.toFixed(6)}, ${p.lon.toFixed(6)}`;
   document.getElementById("timeLabel").textContent = new Date(p.ts).toLocaleTimeString();
+
+  if (imuData.length) {
+    const sample = findNearestImu(p.ts);
+    if (sample) {
+      // Vibration proxy: how far the accel magnitude deviates from resting
+      // gravity (~9.8 m/s^2). Not a calibrated metric -- just a quick
+      // visual indicator of how rough the flight is at this moment.
+      const mag = Math.sqrt(sample.accel_x ** 2 + sample.accel_y ** 2 + sample.accel_z ** 2);
+      const vib = Math.abs(mag - 9.8);
+      document.getElementById("vibValue").textContent = vib.toFixed(2) + " m/s²";
+    }
+  }
 
   const roll = p.roll || 0, pitch = p.pitch || 0;
   document.getElementById("attitude-sky").style.transform =

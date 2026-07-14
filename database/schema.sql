@@ -32,3 +32,20 @@ CREATE TABLE IF NOT EXISTS telemetry_points (
 );
 
 CREATE INDEX IF NOT EXISTS idx_telemetry_flight_ts ON telemetry_points(flight_id, ts);
+
+-- IMU samples (GY-521 / MPU6050 on the ESP32 logger). Kept separate from
+-- telemetry_points because it's sampled ~10x faster (~50Hz vs ~5Hz) and has
+-- a completely different schema -- most rows would otherwise be half-empty.
+CREATE TABLE IF NOT EXISTS imu_points (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    flight_id INTEGER NOT NULL REFERENCES flights(id) ON DELETE CASCADE,
+    ts TEXT NOT NULL,                  -- ISO 8601 UTC timestamp of this sample
+    accel_x REAL,                      -- m/s^2
+    accel_y REAL,                      -- m/s^2
+    accel_z REAL,                      -- m/s^2
+    gyro_x REAL,                       -- rad/s
+    gyro_y REAL,                       -- rad/s
+    gyro_z REAL                        -- rad/s
+);
+
+CREATE INDEX IF NOT EXISTS idx_imu_flight_ts ON imu_points(flight_id, ts);

@@ -34,24 +34,30 @@
 #include <TinyGPSPlus.h>
 #include <ArduinoJson.h>
 #include <time.h>
-#include "secrets.h"  // WIFI_SSID, WIFI_PASSWORD, SERVER_URL, API_KEY, DRONE_NAME
-                       // -- copy secrets.h.example to secrets.h and fill in your values
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include "secrets.h"
 
 // ---------- CONFIG ----------
-// Credentials live in secrets.h (gitignored). Only non-sensitive tuning
-// knobs stay here.
-const unsigned long WIFI_CONNECT_TIMEOUT_MS = 8000;   // how long to try WiFi on boot
-const unsigned long GPS_MIN_INTERVAL_MS     = 200;    // max ~5 samples/sec
+const unsigned long WIFI_CONNECT_TIMEOUT_MS = 8000;
+const unsigned long GPS_MIN_INTERVAL_MS     = 200;   // ~5 samples/sec
+const unsigned long IMU_SAMPLE_INTERVAL_MS  = 20;    // ~50 samples/sec
 // -----------------------------------------
 
 #define GPS_RX_PIN 16
 #define GPS_TX_PIN 17
+#define I2C_SDA_PIN 4
+#define I2C_SCL_PIN 5
+
 HardwareSerial GPSSerial(2);
 TinyGPSPlus gps;
+Adafruit_MPU6050 mpu;
+bool imuOk = false;
 
 const char* LOG_FILE_PATH = "/flight_log.jsonl";
-unsigned long lastWriteMs = 0;
-bool loggingActive = false;
+unsigned long lastGpsWriteMs = 0;
+unsigned long lastImuWriteMs = 0;
 
 // ---------- WiFi / time ----------
 
@@ -90,26 +96,48 @@ void syncTime() {
 // ---------- Flight file handling ----------
 
 void startNewFlightLog() {
-  // Fresh file for this session (any old data was already uploaded/cleared above)
   File f = LittleFS.open(LOG_FILE_PATH, "w");
   if (f) {
     f.close();
-    loggingActive = true;
     Serial.println("New flight log started.");
   } else {
     Serial.println("Failed to create flight log file!");
   }
 }
 
-void writeFix(unsigned long nowMs) {
+void writeGpsFix(unsigned long nowMs) {
   StaticJsonDocument<256> doc;
+  doc["type"] = "gps";
   doc["ms"] = nowMs;
   doc["lat"] = gps.location.lat();
   doc["lon"] = gps.location.lng();
   doc["alt"] = gps.altitude.isValid() ? gps.altitude.meters() : (double)NAN;
   doc["sats"] = gps.satellites.isValid() ? gps.satellites.value() : -1;
   doc["hdop"] = gps.hdop.isValid() ? gps.hdop.hdop() : (double)NAN;
-  // Future IMU fields go here, e.g.: doc["roll"] = ...; doc["pitch"] = ...; doc["yaw"] = ...;
+
+  File f = LittleFS.open(LOG_FILE_PATH, "a");
+  if (!f) {
+    Serial.println("Could not open log file for append.");
+    return;
+  }
+  serializeJson(doc, f);
+  f.print("\n");
+  f.close();
+}
+
+void writeImuSample(unsigned long nowMs) {
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+
+  StaticJsonDocument<192> doc;
+  doc["type"] = "imu";
+  doc["ms"] = nowMs;
+  doc["ax"] = a.acceleration.x;
+  doc["ay"] = a.acceleration.y;
+  doc["az"] = a.acceleration.z;
+  doc["gx"] = g.gyro.x;
+  doc["gy"] = g.gyro.y;
+  doc["gz"] = g.gyro.z;
 
   File f = LittleFS.open(LOG_FILE_PATH, "a");
   if (!f) {
@@ -198,11 +226,23 @@ void setup() {
 
   GPSSerial.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
 
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  if (!mpu.begin()) {
+    Serial.println("MPU6050 not found -- continuing with GPS-only logging.");
+    imuOk = false;
+  } else {
+    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+    imuOk = true;
+    Serial.println("MPU6050 ready.");
+  }
+
   bool wifiOk = connectWiFi();
 
   if (wifiOk) {
     syncTime();
-    uploadPendingFlight();  // send last flight's data, then clear it
+    uploadPendingFlight();
   } else {
     Serial.println("No WiFi at boot -- logging locally only.");
   }
@@ -210,18 +250,24 @@ void setup() {
   startNewFlightLog();
 }
 
-// ---------- Main loop: just log GPS ----------
+// ---------- Main loop ----------
 
 void loop() {
   while (GPSSerial.available() > 0) {
     gps.encode(GPSSerial.read());
   }
 
+  unsigned long now = millis();
+
   if (gps.location.isUpdated() && gps.location.isValid()) {
-    unsigned long now = millis();
-    if (now - lastWriteMs >= GPS_MIN_INTERVAL_MS) {
-      writeFix(now);
-      lastWriteMs = now;
+    if (now - lastGpsWriteMs >= GPS_MIN_INTERVAL_MS) {
+      writeGpsFix(now);
+      lastGpsWriteMs = now;
     }
+  }
+
+  if (imuOk && (now - lastImuWriteMs >= IMU_SAMPLE_INTERVAL_MS)) {
+    writeImuSample(now);
+    lastImuWriteMs = now;
   }
 }
