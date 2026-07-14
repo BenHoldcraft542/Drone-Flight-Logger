@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>Drone Flight Logger</title>
 
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<link rel="stylesheet" href="/assets/vendor/leaflet.css" />
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 
@@ -338,9 +338,9 @@
   </footer>
 </div>
 
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-<script src="https://unpkg.com/three@0.160.0/build/three.min.js"></script>
-<script src="https://unpkg.com/three@0.160.0/examples/js/controls/OrbitControls.js"></script>
+<script src="/assets/vendor/leaflet.js"></script>
+<script src="/assets/vendor/three.min.js"></script>
+<script src="/assets/vendor/OrbitControls.js"></script>
 
 <script>
 const API = ""; // same origin
@@ -410,8 +410,42 @@ function findNearestImu(ts) {
 let map, pathLine, marker2d;
 
 function initMap() {
-  map = L.map('map2d', { zoomControl: true, attributionControl: false }).setView([0, 0], 2);
+  map = L.map('map2d', {
+    zoomControl: true,
+    attributionControl: false,
+    scrollWheelZoom: true,
+    doubleClickZoom: true,
+    dragging: true,
+    touchZoom: true,
+  }).setView([0, 0], 2);
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 20 }).addTo(map);
+
+  // Click anywhere on the map -> jump playback to the nearest recorded point.
+  map.on('click', (e) => {
+    if (telemetry.length === 0) return;
+    const idx = findNearestTelemetryByLatLng(e.latlng.lat, e.latlng.lng);
+    stopPlayback();
+    renderFrame(idx);
+  });
+
+  window.addEventListener("resize", () => {
+    if (map) map.invalidateSize();
+  });
+}
+
+// Nearest telemetry point to a clicked lat/lng, by simple squared-distance
+// scan (telemetry arrays are small enough -- thousands, not millions -- that
+// this doesn't need a spatial index).
+function findNearestTelemetryByLatLng(lat, lng) {
+  let bestIdx = 0;
+  let bestDist = Infinity;
+  for (let i = 0; i < telemetry.length; i++) {
+    const dLat = telemetry[i].lat - lat;
+    const dLng = telemetry[i].lon - lng;
+    const dist = dLat * dLat + dLng * dLng;
+    if (dist < bestDist) { bestDist = dist; bestIdx = i; }
+  }
+  return bestIdx;
 }
 
 function buildMapPath() {
@@ -421,6 +455,14 @@ function buildMapPath() {
   pathLine = L.polyline(latlngs, { color: '#4FD8E8', weight: 3 }).addTo(map);
   marker2d = L.circleMarker(latlngs[0], { radius: 6, color: '#E8A23D', fillColor: '#E8A23D', fillOpacity: 1 }).addTo(map);
   map.fitBounds(pathLine.getBounds(), { padding: [30, 30] });
+
+  // Path itself is also clickable (it sits visually on top of the base map
+  // in most spots), same jump-to-nearest-point behavior.
+  pathLine.on('click', (e) => {
+    const idx = findNearestTelemetryByLatLng(e.latlng.lat, e.latlng.lng);
+    stopPlayback();
+    renderFrame(idx);
+  });
 }
 
 // ---------- 3D view (Three.js) ----------
