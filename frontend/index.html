@@ -480,16 +480,18 @@ function initScene() {
   renderer.setSize(el.clientWidth, el.clientHeight);
   el.appendChild(renderer.domElement);
 
-  controls = new THREE.OrbitControls(camera, renderer.domElement);
+  if (typeof THREE.OrbitControls !== "undefined") { controls = new THREE.OrbitControls(camera, 
+    renderer.domElement);
+} else {
+    console.warn("OrbitControls not loaded."); controls = { update: () => {}, target: new THREE.Vector3()
+    };
+}
 
-  const grid = new THREE.GridHelper(400, 40, 0x212B3A, 0x182131);
-  scene.add(grid);
-  scene.add(new THREE.AmbientLight(0xffffff, 1));
+  const grid = new THREE.GridHelper(400, 40, 0x212B3A, 0x182131); scene.add(grid); scene.add(new 
+  THREE.AmbientLight(0xffffff, 1));
 
-  window.addEventListener("resize", () => {
-    camera.aspect = el.clientWidth / el.clientHeight;
-    camera.updateProjectionMatrix();
-    renderer.setSize(el.clientWidth, el.clientHeight);
+  window.addEventListener("resize", () => { camera.aspect = el.clientWidth / el.clientHeight; 
+    camera.updateProjectionMatrix(); renderer.setSize(el.clientWidth, el.clientHeight);
   });
 
   animate();
