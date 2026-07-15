@@ -204,11 +204,17 @@ void uploadPendingFlight() {
   http.addHeader("X-API-Key", API_KEY);
   int status = http.POST(body);
 
+  Serial.printf("HTTP Status: %d\n", status);
+
+  String response = http.getString();
+  Serial.println("Server response:");
+  Serial.println(response);
+
   if (status == 200 || status == 201) {
-    Serial.println("Upload succeeded. Clearing local log.");
-    LittleFS.remove(LOG_FILE_PATH);
+      Serial.println("Upload succeeded. Clearing local log.");
+      LittleFS.remove(LOG_FILE_PATH);
   } else {
-    Serial.printf("Upload failed (HTTP %d). Keeping local log for next try.\n", status);
+      Serial.println("Upload failed. Keeping local log.");
   }
   http.end();
 }

@@ -339,11 +339,21 @@
 </div>
 
 <script src="/assets/vendor/leaflet.js"></script>
-<script src="/assets/vendor/three.min.js"></script>
-<script src="/assets/vendor/OrbitControls.js"></script>
 
-<script>
-const API = ""; // same origin
+<script type="importmap">
+{
+  "imports": {
+    "three": "/assets/vendor/build/three.module.js"
+  }
+}
+</script>
+
+<script type="module">
+
+import * as THREE from "/assets/vendor/build/three.module.js";
+import { OrbitControls } from "/assets/vendor/examples/jsm/controls/OrbitControls.js";
+
+const API = "";
 
 let telemetry = [];
 let imuData = [];   // may stay empty -- not every flight source (e.g. MAVLink) logs raw IMU
@@ -470,28 +480,60 @@ let scene, camera, renderer, controls, pathLine3d, marker3d, origin;
 
 function initScene() {
   const el = document.getElementById("view3d");
+
   scene = new THREE.Scene();
   scene.background = new THREE.Color(0x060809);
 
-  camera = new THREE.PerspectiveCamera(60, el.clientWidth / el.clientHeight, 0.1, 100000);
+  camera = new THREE.PerspectiveCamera(
+    60,
+    el.clientWidth / el.clientHeight,
+    0.1,
+    100000
+  );
+
   camera.position.set(50, 50, 50);
 
-  renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer = new THREE.WebGLRenderer({
+    antialias: true
+  });
+
   renderer.setSize(el.clientWidth, el.clientHeight);
   el.appendChild(renderer.domElement);
 
-  if (typeof THREE.OrbitControls !== "undefined") { controls = new THREE.OrbitControls(camera, 
-    renderer.domElement);
-} else {
-    console.warn("OrbitControls not loaded."); controls = { update: () => {}, target: new THREE.Vector3()
-    };
-}
+  controls = new OrbitControls(
+    camera,
+    renderer.domElement
+  );
 
-  const grid = new THREE.GridHelper(400, 40, 0x212B3A, 0x182131); scene.add(grid); scene.add(new 
-  THREE.AmbientLight(0xffffff, 1));
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.05;
 
-  window.addEventListener("resize", () => { camera.aspect = el.clientWidth / el.clientHeight; 
-    camera.updateProjectionMatrix(); renderer.setSize(el.clientWidth, el.clientHeight);
+  const grid = new THREE.GridHelper(
+    400,
+    40,
+    0x212B3A,
+    0x182131
+  );
+
+  scene.add(grid);
+
+  scene.add(
+    new THREE.AmbientLight(
+      0xffffff,
+      1
+    )
+  );
+
+  window.addEventListener("resize", () => {
+    camera.aspect =
+      el.clientWidth / el.clientHeight;
+
+    camera.updateProjectionMatrix();
+
+    renderer.setSize(
+      el.clientWidth,
+      el.clientHeight
+    );
   });
 
   animate();
