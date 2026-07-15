@@ -76,6 +76,27 @@
     font-size: 12px;
   }
 
+  #deleteFlightBtn {
+    background: var(--bg);
+    color: #C9605A;
+    border: 1px solid var(--panel-border);
+    border-radius: 4px;
+    padding: 6px 12px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    letter-spacing: 0.05em;
+    cursor: pointer;
+  }
+  #deleteFlightBtn:hover:not(:disabled) {
+    background: #C9605A;
+    border-color: #C9605A;
+    color: #1a0d0c;
+  }
+  #deleteFlightBtn:disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
+  }
+
   .view-toggle {
     display: flex;
     border: 1px solid var(--panel-border);
@@ -266,6 +287,7 @@
     <select id="flightSelect">
       <option value="">Loading flights…</option>
     </select>
+    <button id="deleteFlightBtn" title="Delete selected flight" disabled>DELETE</button>
     <div class="view-toggle">
       <button id="btn2d" class="active">2D MAP</button>
       <button id="btn3d">3D VIEW</button>
@@ -362,20 +384,67 @@ let playing = false;
 let playTimer = null;
 
 // ---------- Flight selector ----------
-async function loadFlights() {
+async function loadFlights(selectId) {
   const res = await fetch(`${API}/api/flights`);
   const flights = await res.json();
   const sel = document.getElementById("flightSelect");
+  const delBtn = document.getElementById("deleteFlightBtn");
   sel.innerHTML = "";
   if (flights.length === 0) {
     sel.innerHTML = `<option value="">No flights logged yet</option>`;
+    delBtn.disabled = true;
     return;
   }
   sel.innerHTML = `<option value="">Select a flight…</option>` + flights.map(f =>
     `<option value="${f.id}">${f.drone_name} — ${new Date(f.started_at).toLocaleString()} (${f.point_count} pts)</option>`
   ).join("");
-  sel.onchange = () => sel.value && loadFlight(sel.value);
+  if (selectId && flights.some(f => String(f.id) === String(selectId))) {
+    sel.value = selectId;
+  }
+  delBtn.disabled = !sel.value;
+  sel.onchange = () => {
+    delBtn.disabled = !sel.value;
+    sel.value && loadFlight(sel.value);
+  };
 }
+
+async function deleteSelectedFlight() {
+  const sel = document.getElementById("flightSelect");
+  const delBtn = document.getElementById("deleteFlightBtn");
+  const flightId = sel.value;
+  if (!flightId) return;
+
+  const label = sel.options[sel.selectedIndex].textContent;
+  if (!confirm(`Delete this flight?\n\n${label}\n\nThis can't be undone.`)) return;
+
+  delBtn.disabled = true;
+  try {
+    const res = await fetch(`${API}/api/flights/${flightId}`, { method: "DELETE" });
+    if (!res.ok) {
+      alert("Couldn't delete that flight -- try again.");
+      delBtn.disabled = false;
+      return;
+    }
+  } catch {
+    alert("Couldn't reach the server to delete that flight.");
+    delBtn.disabled = false;
+    return;
+  }
+
+  // Clear the view since the flight we were looking at is gone.
+  telemetry = [];
+  imuData = [];
+  currentIndex = 0;
+  if (pathLine) { map.removeLayer(pathLine); pathLine = null; }
+  if (marker2d) { map.removeLayer(marker2d); marker2d = null; }
+  if (pathLine3d) { scene.remove(pathLine3d); pathLine3d = null; }
+  if (marker3d) { scene.remove(marker3d); marker3d = null; }
+  document.getElementById("empty-state").style.display = "flex";
+
+  await loadFlights();
+}
+
+document.getElementById("deleteFlightBtn").addEventListener("click", deleteSelectedFlight);
 
 async function loadFlight(id) {
   const res = await fetch(`${API}/api/flights/${id}/telemetry`);

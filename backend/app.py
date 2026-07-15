@@ -143,6 +143,25 @@ def get_imu(flight_id: int, limit: int = 100000):
     return [dict(r) for r in rows]
 
 
+@app.delete("/api/flights/{flight_id}")
+def delete_flight(flight_id: int):
+    conn = get_db()
+    row = conn.execute("SELECT id FROM flights WHERE id = ?", (flight_id,)).fetchone()
+    if row is None:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Flight not found")
+
+    # Deleted explicitly rather than relying on the schema's ON DELETE
+    # CASCADE -- SQLite only enforces that if "PRAGMA foreign_keys = ON"
+    # was set on this connection, which it isn't here.
+    conn.execute("DELETE FROM telemetry_points WHERE flight_id = ?", (flight_id,))
+    conn.execute("DELETE FROM imu_points WHERE flight_id = ?", (flight_id,))
+    conn.execute("DELETE FROM flights WHERE id = ?", (flight_id,))
+    conn.commit()
+    conn.close()
+    return {"deleted": flight_id}
+
+
 # --- ESP32 / offline-logger ingestion ---
 # The ESP32 logs GPS fixes and IMU samples on independent timers while
 # flying (no live clock needed), tagging each JSON line with "type": "gps"
@@ -171,6 +190,17 @@ class TelemetryPoint(BaseModel):
 class FlightUpload(BaseModel):
     drone_name: str
     upload_time: str  # ISO 8601 UTC, e.g. "2026-07-12T20:15:00Z"
+    # flight_id: omit on the first batch of a flight (a new flight row is
+    # created and returned); include the returned flight_id on every
+    # subsequent batch so points are appended to the same flight instead of
+    # creating a new one. This lets the ESP32 upload a long flight as many
+    # small requests instead of one huge one.
+    flight_id: Optional[int] = None
+    # ms of the FIRST and LAST point of the *entire* flight (not just this
+    # batch) -- needed so every batch reconstructs real timestamps against
+    # the same anchor, regardless of upload order or chunk size.
+    flight_first_ms: int
+    flight_last_ms: int
     points: List[TelemetryPoint]
 
 
@@ -180,19 +210,28 @@ def ingest_flight(upload: FlightUpload):
         raise HTTPException(status_code=400, detail="No points in upload")
 
     upload_dt = datetime.fromisoformat(upload.upload_time.replace("Z", "+00:00"))
-    last_ms = max(p.ms for p in upload.points)
-    first_ms = min(p.ms for p in upload.points)
+    last_ms = upload.flight_last_ms
 
     conn = sqlite3.connect(DB_PATH)
     with open(BASE_DIR.parent / "database" / "schema.sql") as f:
         conn.executescript(f.read())
 
-    first_ts = upload_dt - timedelta(milliseconds=(last_ms - first_ms))
-    cur = conn.execute(
-        "INSERT INTO flights (drone_name, started_at, ended_at, notes) VALUES (?, ?, ?, ?)",
-        (upload.drone_name, first_ts.isoformat(), upload_dt.isoformat(), "Uploaded from ESP32 flash log"),
-    )
-    flight_id = cur.lastrowid
+    if upload.flight_id is None:
+        # First batch of this flight: create the flight row.
+        first_ts = upload_dt - timedelta(milliseconds=(upload.flight_last_ms - upload.flight_first_ms))
+        cur = conn.execute(
+            "INSERT INTO flights (drone_name, started_at, ended_at, notes) VALUES (?, ?, ?, ?)",
+            (upload.drone_name, first_ts.isoformat(), upload_dt.isoformat(), "Uploaded from ESP32 flash log"),
+        )
+        flight_id = cur.lastrowid
+    else:
+        # Later batch: append to the existing flight.
+        flight_id = upload.flight_id
+        row = conn.execute("SELECT id FROM flights WHERE id = ?", (flight_id,)).fetchone()
+        if row is None:
+            conn.close()
+            raise HTTPException(status_code=404, detail=f"flight_id {flight_id} not found")
+        conn.execute("UPDATE flights SET ended_at = ? WHERE id = ?", (upload_dt.isoformat(), flight_id))
 
     gps_count = 0
     imu_count = 0
@@ -200,7 +239,7 @@ def ingest_flight(upload: FlightUpload):
 
     for p in upload.points:
         # Each point's real time = upload time, minus how far before the
-        # last recorded point it was captured.
+        # last point *of the whole flight* it was captured.
         point_dt = upload_dt - timedelta(milliseconds=(last_ms - p.ms))
 
         if p.type == "gps":
