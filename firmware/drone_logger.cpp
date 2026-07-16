@@ -12,6 +12,12 @@
     5. If WiFi never connects, it just keeps logging locally -- nothing is
        lost. The file uploads next time it boots near WiFi.
 
+  Onboard LED:
+    The built-in LED flashes once per data point written to the flight
+    log (GPS fix or IMU sample), so you get a visual heartbeat confirming
+    logging is actually happening. If you don't see it flashing while
+    flying, the log file isn't being written to.
+
   Wiring (NEO-6M / similar GPS module -> ESP32, using UART2):
     GPS TX  -> ESP32 GPIO16 (RX2)
     GPS RX  -> ESP32 GPIO17 (TX2)
@@ -43,12 +49,19 @@
 const unsigned long WIFI_CONNECT_TIMEOUT_MS = 8000;
 const unsigned long GPS_MIN_INTERVAL_MS     = 200;   // ~5 samples/sec
 const unsigned long IMU_SAMPLE_INTERVAL_MS  = 20;    // ~50 samples/sec
+const unsigned long LOG_LED_FLASH_MS        = 15;    // how long the LED stays on per flash
 // -----------------------------------------
 
 #define GPS_RX_PIN 16
 #define GPS_TX_PIN 17
 #define I2C_SDA_PIN 4
 #define I2C_SCL_PIN 5
+
+// Most ESP32 dev boards (including the common "ESP32 DevKit" ones) have
+// a built-in LED on GPIO2. If yours doesn't light up, check your board's
+// pinout -- some boards use a different pin or have no onboard LED at all,
+// in which case wire an external LED + resistor to this pin instead.
+#define LOG_LED_PIN 2
 
 HardwareSerial GPSSerial(2);
 TinyGPSPlus gps;
@@ -58,6 +71,25 @@ bool imuOk = false;
 const char* LOG_FILE_PATH = "/flight_log.jsonl";
 unsigned long lastGpsWriteMs = 0;
 unsigned long lastImuWriteMs = 0;
+
+// LED flash state -- non-blocking, so it never slows down GPS/IMU sampling.
+bool logLedOn = false;
+unsigned long logLedOnSinceMs = 0;
+
+// ---------- Onboard LED ----------
+
+void flashLogLed() {
+  digitalWrite(LOG_LED_PIN, HIGH);
+  logLedOn = true;
+  logLedOnSinceMs = millis();
+}
+
+void serviceLogLed() {
+  if (logLedOn && (millis() - logLedOnSinceMs >= LOG_LED_FLASH_MS)) {
+    digitalWrite(LOG_LED_PIN, LOW);
+    logLedOn = false;
+  }
+}
 
 // ---------- WiFi / time ----------
 
@@ -123,6 +155,8 @@ void writeGpsFix(unsigned long nowMs) {
   serializeJson(doc, f);
   f.print("\n");
   f.close();
+
+  flashLogLed();
 }
 
 void writeImuSample(unsigned long nowMs) {
@@ -147,6 +181,8 @@ void writeImuSample(unsigned long nowMs) {
   serializeJson(doc, f);
   f.print("\n");
   f.close();
+
+  flashLogLed();
 }
 
 // ---------- Upload previous flight over WiFi ----------
@@ -176,6 +212,10 @@ void uploadPendingFlight() {
   payload["upload_time"] = isoTime;
 
   JsonArray points = payload.createNestedArray("points");
+  unsigned long firstMs = 0;
+  unsigned long lastMs = 0;
+  bool haveRange = false;
+
   while (f.available()) {
     String line = f.readStringUntil('\n');
     if (line.length() < 2) continue;
@@ -183,6 +223,16 @@ void uploadPendingFlight() {
     DeserializationError err = deserializeJson(point, line);
     if (!err) {
       points.add(point.as<JsonObject>());
+
+      unsigned long pointMs = point["ms"].as<unsigned long>();
+      if (!haveRange) {
+        firstMs = pointMs;
+        lastMs = pointMs;
+        haveRange = true;
+      } else {
+        if (pointMs < firstMs) firstMs = pointMs;
+        if (pointMs > lastMs) lastMs = pointMs;
+      }
     }
   }
   f.close();
@@ -192,6 +242,11 @@ void uploadPendingFlight() {
     LittleFS.remove(LOG_FILE_PATH);
     return;
   }
+
+  // Server requires these to anchor each point's real timestamp against
+  // upload_time -- see FlightUpload model in backend/app.py.
+  payload["flight_first_ms"] = firstMs;
+  payload["flight_last_ms"] = lastMs;
 
   String body;
   serializeJson(payload, body);
@@ -224,6 +279,9 @@ void uploadPendingFlight() {
 void setup() {
   Serial.begin(115200);
   delay(500);
+
+  pinMode(LOG_LED_PIN, OUTPUT);
+  digitalWrite(LOG_LED_PIN, LOW);
 
   if (!LittleFS.begin(true)) {
     Serial.println("LittleFS mount failed. Halting.");
@@ -276,4 +334,6 @@ void loop() {
     writeImuSample(now);
     lastImuWriteMs = now;
   }
+
+  serviceLogLed();
 }
