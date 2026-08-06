@@ -90,7 +90,7 @@ def ensure_imu_orientation_columns(conn: sqlite3.Connection):
     Safe to call repeatedly: checks existing columns via PRAGMA first,
     since SQLite has no "ADD COLUMN IF NOT EXISTS".
     """
-    existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(imu_points)")}
+    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(imu_points)")}
     for col in ("roll", "pitch", "yaw"):
         if col not in existing_cols:
             conn.execute(f"ALTER TABLE imu_points ADD COLUMN {col} REAL")
