@@ -61,12 +61,40 @@ app.add_middleware(
 )
 
 
+@app.on_event("startup")
+def run_startup_migrations():
+    # Runs once when the server starts (e.g. on systemd boot), not per
+    # request -- so GET endpoints work correctly on an existing database
+    # even before any new ESP32 upload triggers the ingest-time check below.
+    if DB_PATH.exists():
+        conn = sqlite3.connect(DB_PATH)
+        ensure_imu_orientation_columns(conn)
+        conn.close()
+
+
 def get_db():
     if not DB_PATH.exists():
         raise HTTPException(status_code=503, detail="No flight database yet. Run the logger first.")
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def ensure_imu_orientation_columns(conn: sqlite3.Connection):
+    """
+    One-time migration for databases created before roll/pitch/yaw were
+    added to imu_points. schema.sql's CREATE TABLE IF NOT EXISTS only
+    applies to brand-new databases -- it won't add columns to a table
+    that already exists (e.g. flights.db already running on BensPi).
+
+    Safe to call repeatedly: checks existing columns via PRAGMA first,
+    since SQLite has no "ADD COLUMN IF NOT EXISTS".
+    """
+    existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(imu_points)")}
+    for col in ("roll", "pitch", "yaw"):
+        if col not in existing_cols:
+            conn.execute(f"ALTER TABLE imu_points ADD COLUMN {col} REAL")
+    conn.commit()
 
 
 @app.get("/api/flights")
@@ -129,7 +157,8 @@ def get_imu(flight_id: int, limit: int = 100000):
     conn = get_db()
     rows = conn.execute(
         """
-        SELECT ts, accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z
+        SELECT ts, accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z,
+               roll, pitch, yaw
         FROM imu_points
         WHERE flight_id = ?
         ORDER BY ts ASC
@@ -185,6 +214,12 @@ class TelemetryPoint(BaseModel):
     gx: Optional[float] = None
     gy: Optional[float] = None
     gz: Optional[float] = None
+    # Orientation, computed onboard via Madgwick AHRS filter (IMU-only,
+    # no magnetometer -- yaw is relative, not a true heading, and drifts
+    # slowly since nothing external corrects it)
+    roll: Optional[float] = None
+    pitch: Optional[float] = None
+    yaw: Optional[float] = None
 
 
 class FlightUpload(BaseModel):
@@ -215,6 +250,7 @@ def ingest_flight(upload: FlightUpload):
     conn = sqlite3.connect(DB_PATH)
     with open(BASE_DIR.parent / "database" / "schema.sql") as f:
         conn.executescript(f.read())
+    ensure_imu_orientation_columns(conn)
 
     if upload.flight_id is None:
         # First batch of this flight: create the flight row.
@@ -260,10 +296,12 @@ def ingest_flight(upload: FlightUpload):
             conn.execute(
                 """
                 INSERT INTO imu_points (
-                    flight_id, ts, accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    flight_id, ts, accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z,
+                    roll, pitch, yaw
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (flight_id, point_dt.isoformat(), p.ax, p.ay, p.az, p.gx, p.gy, p.gz),
+                (flight_id, point_dt.isoformat(), p.ax, p.ay, p.az, p.gx, p.gy, p.gz,
+                 p.roll, p.pitch, p.yaw),
             )
             imu_count += 1
 

@@ -36,6 +36,10 @@ CREATE INDEX IF NOT EXISTS idx_telemetry_flight_ts ON telemetry_points(flight_id
 -- IMU samples (GY-521 / MPU6050 on the ESP32 logger). Kept separate from
 -- telemetry_points because it's sampled ~10x faster (~50Hz vs ~5Hz) and has
 -- a completely different schema -- most rows would otherwise be half-empty.
+--
+-- roll/pitch/yaw: onboard orientation estimate (Madgwick AHRS filter,
+-- IMU-only -- no magnetometer, so yaw is relative and drifts slowly).
+-- NULL for older rows logged before this was added.
 CREATE TABLE IF NOT EXISTS imu_points (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     flight_id INTEGER NOT NULL REFERENCES flights(id) ON DELETE CASCADE,
@@ -45,7 +49,10 @@ CREATE TABLE IF NOT EXISTS imu_points (
     accel_z REAL,                      -- m/s^2
     gyro_x REAL,                       -- rad/s
     gyro_y REAL,                       -- rad/s
-    gyro_z REAL                        -- rad/s
+    gyro_z REAL,                       -- rad/s
+    roll REAL,                         -- degrees
+    pitch REAL,                        -- degrees
+    yaw REAL                           -- degrees (relative, drifts -- no magnetometer)
 );
 
 CREATE INDEX IF NOT EXISTS idx_imu_flight_ts ON imu_points(flight_id, ts);

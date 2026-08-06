@@ -671,6 +671,12 @@ function renderFrame(i) {
   document.getElementById("posValue").textContent = `${p.lat.toFixed(6)}, ${p.lon.toFixed(6)}`;
   document.getElementById("timeLabel").textContent = new Date(p.ts).toLocaleTimeString();
 
+  // Orientation: prefer the telemetry point's own roll/pitch/yaw (MAVLink
+  // flights log this at GPS rate). ESP32 flights only compute orientation
+  // on IMU samples (~50Hz, via onboard Madgwick filter), so fall back to
+  // the nearest IMU sample when the telemetry point doesn't have its own.
+  let roll = p.roll, pitch = p.pitch, yaw = p.yaw;
+
   if (imuData.length) {
     const sample = findNearestImu(p.ts);
     if (sample) {
@@ -680,10 +686,17 @@ function renderFrame(i) {
       const mag = Math.sqrt(sample.accel_x ** 2 + sample.accel_y ** 2 + sample.accel_z ** 2);
       const vib = Math.abs(mag - 9.8);
       document.getElementById("vibValue").textContent = vib.toFixed(2) + " m/s²";
+
+      if (roll == null) roll = sample.roll;
+      if (pitch == null) pitch = sample.pitch;
+      if (yaw == null) yaw = sample.yaw;
     }
   }
 
-  const roll = p.roll || 0, pitch = p.pitch || 0;
+  document.getElementById("hdgValue").textContent = (yaw != null ? yaw.toFixed(0) : "--") + "°";
+
+  roll = roll || 0;
+  pitch = pitch || 0;
   document.getElementById("attitude-sky").style.transform =
     `translateY(${pitch * 1.5}px) rotate(${-roll}deg)`;
 
