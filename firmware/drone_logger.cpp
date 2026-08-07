@@ -65,6 +65,7 @@ const unsigned long WIFI_CONNECT_TIMEOUT_MS = 8000;
 const unsigned long GPS_MIN_INTERVAL_MS     = 200;   // ~5 samples/sec
 const unsigned long IMU_SAMPLE_INTERVAL_MS  = 20;    // ~50 samples/sec
 const unsigned long LOG_LED_FLASH_MS        = 15;    // how long the LED stays on per flash
+const int UPLOAD_BATCH_SIZE                 = 150;   // points per upload request, keeps each JsonDocument/String small
 // -----------------------------------------
 
 #define GPS_RX_PIN 16
@@ -177,7 +178,8 @@ unsigned long lastImuWriteMs = 0;
 // Logging only actually starts once the boot button is pressed -- avoids
 // wasting the WiFi-timeout / NTP-sync window at the start of the flight log.
 bool loggingActive = false;
-bool lastButtonState = HIGH; // HIGH = not pressed (pull-up)
+bool lastRawButtonReading = HIGH;  // most recent raw (unfiltered) pin reading
+bool debouncedButtonState = HIGH;  // confirmed/stable state, HIGH = not pressed
 unsigned long lastButtonChangeMs = 0;
 
 // LED flash state -- non-blocking, so it never slows down GPS/IMU sampling.
@@ -287,20 +289,36 @@ bool checkBootButtonPressed() {
   bool reading = digitalRead(BOOT_BUTTON_PIN);
   unsigned long now = millis();
 
-  if (reading != lastButtonState) {
-    lastButtonChangeMs = now; // state just changed, restart debounce window
+  if (reading != lastRawButtonReading) {
+    lastButtonChangeMs = now; // raw signal just changed, restart debounce window
   }
+  lastRawButtonReading = reading;
 
   bool pressed = false;
   if ((now - lastButtonChangeMs) > BUTTON_DEBOUNCE_MS) {
-    // Debounced: LOW means currently pressed. Only fire on the falling edge.
-    if (reading == LOW && lastButtonState == HIGH) {
-      pressed = true;
+    // Debounce window elapsed with a stable reading -- safe to trust it.
+    // Only fire on the falling edge of the *debounced* state, not the raw one.
+    if (reading != debouncedButtonState) {
+      debouncedButtonState = reading;
+      if (debouncedButtonState == LOW) {
+        pressed = true;
+      }
     }
   }
 
-  lastButtonState = reading;
   return pressed;
+}
+
+// ---------- Flight file handling ----------
+
+void startNewFlightLog() {
+  File f = LittleFS.open(LOG_FILE_PATH, "w");
+  if (f) {
+    f.close();
+    Serial.println("New flight log started.");
+  } else {
+    Serial.println("Failed to create flight log file!");
+  }
 }
 
 void startLogging() {
@@ -324,20 +342,8 @@ void startLogging() {
   Serial.println("Boot button pressed -- logging started.");
 }
 
-// ---------- Flight file handling ----------
-
-void startNewFlightLog() {
-  File f = LittleFS.open(LOG_FILE_PATH, "w");
-  if (f) {
-    f.close();
-    Serial.println("New flight log started.");
-  } else {
-    Serial.println("Failed to create flight log file!");
-  }
-}
-
 void writeGpsFix(unsigned long nowMs) {
-  StaticJsonDocument<256> doc;
+  JsonDocument doc;
   doc["type"] = "gps";
   doc["ms"] = nowMs;
   doc["lat"] = gps.location.lat();
@@ -382,7 +388,7 @@ void writeImuSample(unsigned long nowMs) {
                               a.acceleration.x, a.acceleration.y, a.acceleration.z, dt);
   }
 
-  StaticJsonDocument<256> doc;
+  JsonDocument doc;
   doc["type"] = "imu";
   doc["ms"] = nowMs;
   doc["ax"] = a.acceleration.x;
@@ -422,30 +428,21 @@ void uploadPendingFlight() {
     return;
   }
 
-  // Build the JSON payload: { drone_name, upload_time, points: [...] }
-  DynamicJsonDocument payload(65536); // adjust up if you log long flights at high rate
-  payload["drone_name"] = DRONE_NAME;
-
-  time_t nowT = time(nullptr);
-  char isoTime[32];
-  struct tm tmInfo;
-  gmtime_r(&nowT, &tmInfo);
-  strftime(isoTime, sizeof(isoTime), "%Y-%m-%dT%H:%M:%SZ", &tmInfo);
-  payload["upload_time"] = isoTime;
-
-  JsonArray points = payload.createNestedArray("points");
+  // ---- Pass 1: pre-scan the whole file for the ms range and point count.
+  // Needed so every batch anchors timestamps against the same first/last
+  // ms, regardless of upload order or how the file gets split into batches.
   unsigned long firstMs = 0;
   unsigned long lastMs = 0;
   bool haveRange = false;
+  unsigned int totalPoints = 0;
 
   while (f.available()) {
     String line = f.readStringUntil('\n');
     if (line.length() < 2) continue;
-    StaticJsonDocument<320> point;
+    JsonDocument point;
     DeserializationError err = deserializeJson(point, line);
     if (!err) {
-      points.add(point.as<JsonObject>());
-
+      totalPoints++;
       unsigned long pointMs = point["ms"].as<unsigned long>();
       if (!haveRange) {
         firstMs = pointMs;
@@ -459,41 +456,102 @@ void uploadPendingFlight() {
   }
   f.close();
 
-  if (points.size() == 0) {
+  if (totalPoints == 0) {
     Serial.println("Log file had no valid points -- discarding.");
     LittleFS.remove(LOG_FILE_PATH);
     return;
   }
 
-  // Server requires these to anchor each point's real timestamp against
-  // upload_time -- see FlightUpload model in backend/app.py.
-  payload["flight_first_ms"] = firstMs;
-  payload["flight_last_ms"] = lastMs;
+  time_t nowT = time(nullptr);
+  char isoTime[32];
+  struct tm tmInfo;
+  gmtime_r(&nowT, &tmInfo);
+  strftime(isoTime, sizeof(isoTime), "%Y-%m-%dT%H:%M:%SZ", &tmInfo);
 
-  String body;
-  serializeJson(payload, body);
+  Serial.printf("Uploading %u points in batches of %d...\n", totalPoints, UPLOAD_BATCH_SIZE);
 
-  Serial.printf("Uploading %d points...\n", points.size());
-
-  HTTPClient http;
-  http.begin(SERVER_URL);
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("X-API-Key", API_KEY);
-  int status = http.POST(body);
-
-  Serial.printf("HTTP Status: %d\n", status);
-
-  String response = http.getString();
-  Serial.println("Server response:");
-  Serial.println(response);
-
-  if (status == 200 || status == 201) {
-      Serial.println("Upload succeeded. Clearing local log.");
-      LittleFS.remove(LOG_FILE_PATH);
-  } else {
-      Serial.println("Upload failed. Keeping local log.");
+  // ---- Pass 2: re-read the file and upload it in small batches. Keeping
+  // each batch's JsonDocument/String small and short-lived (freed at the
+  // end of each loop iteration) avoids the heap exhaustion that a single
+  // huge payload for the whole flight can cause.
+  f = LittleFS.open(LOG_FILE_PATH, "r");
+  if (!f) {
+    Serial.println("Could not reopen log file for upload.");
+    return;
   }
-  http.end();
+
+  int flightId = -1; // -1 = not yet assigned; server returns it after batch 1
+  unsigned int gpsStored = 0, imuStored = 0, skipped = 0;
+  bool uploadFailed = false;
+
+  while (f.available()) {
+    JsonDocument batch;
+    batch["drone_name"] = DRONE_NAME;
+    batch["upload_time"] = isoTime;
+    if (flightId != -1) batch["flight_id"] = flightId;
+    batch["flight_first_ms"] = firstMs;
+    batch["flight_last_ms"] = lastMs;
+    JsonArray points = batch.createNestedArray("points");
+
+    int batchCount = 0;
+    while (f.available() && batchCount < UPLOAD_BATCH_SIZE) {
+      String line = f.readStringUntil('\n');
+      if (line.length() < 2) continue;
+      JsonDocument point;
+      DeserializationError err = deserializeJson(point, line);
+      if (!err) {
+        points.add(point.as<JsonObject>());
+        batchCount++;
+      }
+    }
+
+    if (batchCount == 0) break; // trailing blank lines, nothing left to send
+
+    String body;
+    serializeJson(batch, body);
+
+    HTTPClient http;
+    http.begin(SERVER_URL);
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("X-API-Key", API_KEY);
+    int status = http.POST(body);
+    String response = http.getString();
+    http.end();
+
+    Serial.printf("Batch of %d points -> HTTP %d\n", batchCount, status);
+
+    if (status == 200 || status == 201) {
+      JsonDocument respDoc;
+      DeserializationError respErr = deserializeJson(respDoc, response);
+      if (!respErr) {
+        flightId = respDoc["flight_id"].as<int>();
+        gpsStored += respDoc["gps_points_stored"].as<unsigned int>();
+        imuStored += respDoc["imu_points_stored"].as<unsigned int>();
+        skipped += respDoc["points_skipped"].as<unsigned int>();
+      } else {
+        Serial.println("Could not parse batch response -- flight_id may be lost.");
+      }
+    } else {
+      Serial.println("Batch upload failed -- stopping. Local log kept for retry.");
+      Serial.println(response);
+      uploadFailed = true;
+      break;
+    }
+  }
+  f.close();
+
+  if (!uploadFailed && flightId != -1) {
+    Serial.printf("Upload complete: %u GPS, %u IMU, %u skipped (flight_id=%d)\n",
+                  gpsStored, imuStored, skipped, flightId);
+    Serial.println("Clearing local log.");
+    LittleFS.remove(LOG_FILE_PATH);
+  } else {
+    // NOTE: if some batches succeeded before one failed, those points are
+    // already stored server-side. Retrying uploads the whole file again
+    // next boot, which will re-send (and duplicate) those earlier batches.
+    // Fine for a personal project; worth revisiting if that ever matters.
+    Serial.println("Upload incomplete -- local log kept for retry next boot.");
+  }
 }
 
 // ---------- Setup ----------
