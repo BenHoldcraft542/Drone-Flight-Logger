@@ -28,31 +28,13 @@ No flight controller. No telemetry radio. Just an ESP32, a GPS module, and an IM
 
 ## How it works
 
-```
-   ┌──────────────┐   press BOOT button    ┌────────────────────┐
-   │   ESP32 +    │ ─────────────────────▶ │  Logging to flash  │
-   │  GPS + IMU   │                         │  (LittleFS, JSONL) │
-   └──────────────┘                         └──────────┬─────────┘
-          ▲                                             │ land, power-cycle
-          │                                             │ near WiFi
-          │  next flight                                ▼
-          │                                   ┌────────────────────┐
-          └────────────────────────────────── │  Chunked HTTP POST │
-                                               │  upload (150 pts/  │
-                                               │  batch, API-keyed) │
-                                               └──────────┬─────────┘
-                                                           ▼
-                                          ┌──────────────────────────────┐
-                                          │  FastAPI ground station (Pi) │
-                                          │  reconstructs real UTC       │
-                                          │  timestamps → SQLite         │
-                                          └──────────────┬────────────────┘
-                                                           ▼
-                                          ┌──────────────────────────────┐
-                                          │   Web dashboard: 2D map,     │
-                                          │   3D path, HUD instruments,  │
-                                          │   scrub-to-replay timeline   │
-                                          └──────────────────────────────┘
+```mermaid
+flowchart TD
+    A["ESP32 + GPS + IMU<br/>(idle, waiting to arm)"] -->|"press BOOT button"| B["Logging to flash<br/>(LittleFS, JSONL)"]
+    B -->|"land, power-cycle near WiFi"| C["Chunked HTTP POST upload<br/>(150 pts/batch, API-keyed)"]
+    C --> D["FastAPI ground station (Pi)<br/>reconstructs real UTC timestamps → SQLite"]
+    D --> E["Web dashboard<br/>2D map · 3D path · HUD instruments · scrub-to-replay timeline"]
+    C -.->|"next flight"| A
 ```
 
 1. **On boot**, the ESP32 tries WiFi for a few seconds. If it connects, it syncs real time over NTP and uploads any flight log left over from the last flight — then clears it.
