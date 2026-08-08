@@ -16,13 +16,37 @@
     6. If WiFi never connects, it just keeps logging locally -- nothing is
        lost. The file uploads next time it boots near WiFi.
 
-  Onboard LED:
-    Turns on solid the moment logging starts (button press). After that,
-    it flashes once per data point written to the flight log (GPS fix or
-    IMU sample), so you get a visual heartbeat confirming logging is
-    actively happening. If it's solid-off, logging hasn't been started
-    yet (waiting for button); if it never flashes after button press,
-    the log file isn't being written to.
+  Status LEDs:
+    - CALIBRATE_LED (GPIO32): on solid while the gyro is being calibrated
+      at boot. Off once calibration finishes.
+    - UPLOAD_LED (GPIO33): on solid while a pending flight log is actually
+      being uploaded over WiFi. When the upload finishes it flashes once
+      for success, or three times for any kind of failure (HTTP error,
+      no WiFi, etc).
+    - READY_LED (GPIO25): reflects live GPS/IMU status while waiting for
+      the BOOT button (rechecked every loop, not just once at boot):
+        * off (not blinking)         -> no valid GPS fix yet. The button
+                                         is ignored in this state.
+        * slow blink (~1.25Hz cycle) -> valid GPS fix, no IMU (or IMU
+                                         gone invalid). Safe to press the
+                                         button and log GPS-only.
+        * fast blink (~4Hz cycle)    -> valid GPS fix AND valid IMU
+                                         data. Everything's good to go.
+      A GPS fix is required before a button press actually starts
+      logging -- if you press it while the LED is off, it's ignored
+      and logged to Serial. The moment logging does start, this (and
+      the other two status LEDs, defensively) turn off.
+    - LOG_LED (GPIO2, the usual onboard LED on most dev boards): heartbeat
+      for "logging is actively writing data." Rather than flashing once
+      per GPS/IMU sample (GPS fixes come every ~200ms which is borderline,
+      but IMU samples come every ~20ms -- far too fast for a flash to be
+      visible, or in some cases even to fully turn off before the next
+      write requests it on again), it now toggles on a fixed, easily
+      visible interval (LOG_LED_BLINK_INTERVAL_MS) but ONLY toggles if at
+      least one data point was actually written during that interval.
+      So: steady blinking = data is being logged normally. If it stops
+      blinking (goes dark) while still in a flight, that's your signal
+      that writes have stalled -- e.g. no GPS fix and no IMU.
 
   Wiring (NEO-6M / similar GPS module -> ESP32, using UART2):
     GPS TX  -> ESP32 GPIO16 (RX2)
@@ -61,17 +85,27 @@
 #include "secrets.h"
 
 // ---------- CONFIG ----------
-const unsigned long WIFI_CONNECT_TIMEOUT_MS = 8000;
-const unsigned long GPS_MIN_INTERVAL_MS     = 200;   // ~5 samples/sec
-const unsigned long IMU_SAMPLE_INTERVAL_MS  = 20;    // ~50 samples/sec
-const unsigned long LOG_LED_FLASH_MS        = 15;    // how long the LED stays on per flash
-const int UPLOAD_BATCH_SIZE                 = 150;   // points per upload request, keeps each JsonDocument/String small
+const unsigned long WIFI_CONNECT_TIMEOUT_MS   = 8000;
+const unsigned long GPS_MIN_INTERVAL_MS       = 200;   // ~5 samples/sec
+const unsigned long IMU_SAMPLE_INTERVAL_MS    = 20;    // ~50 samples/sec
+const unsigned long LOG_LED_BLINK_INTERVAL_MS = 400;   // heartbeat toggle period, chosen to be clearly visible
+const int UPLOAD_BATCH_SIZE                   = 150;   // points per upload request, keeps each JsonDocument/String small
+const unsigned long STATUS_LED_FLASH_ON_MS    = 150;
+const unsigned long STATUS_LED_FLASH_OFF_MS   = 150;
+const unsigned long GPS_STALE_MS              = 3000;  // fix older than this counts as "not valid" anymore
+const unsigned long IMU_VALIDITY_CHECK_INTERVAL_MS = 200; // how often to re-sanity-check the IMU while idle
+const unsigned long READY_LED_BLINK_SLOW_MS   = 500;   // GPS valid, IMU not (or not installed)
+const unsigned long READY_LED_BLINK_FAST_MS   = 120;   // GPS + IMU both valid -- good to go
 // -----------------------------------------
 
 #define GPS_RX_PIN 16
 #define GPS_TX_PIN 17
 #define I2C_SDA_PIN 4
 #define I2C_SCL_PIN 5
+
+#define CALIBRATE_LED 32
+#define UPLOAD_LED 33
+#define READY_LED 25
 
 // Most ESP32 dev boards (including the common "ESP32 DevKit" ones) have
 // a built-in LED on GPIO2. If yours doesn't light up, check your board's
@@ -182,22 +216,127 @@ bool lastRawButtonReading = HIGH;  // most recent raw (unfiltered) pin reading
 bool debouncedButtonState = HIGH;  // confirmed/stable state, HIGH = not pressed
 unsigned long lastButtonChangeMs = 0;
 
-// LED flash state -- non-blocking, so it never slows down GPS/IMU sampling.
+// True once setup() has fully finished (calibration + WiFi/upload attempt
+// both done). The BOOT button is only honored while this is true, and
+// only actually starts logging once gpsValid is also true (see loop()).
+bool systemReady = false;
+
+// ---------- Idle-state GPS / IMU validity tracking ----------
+// Continuously rechecked (not just at boot) so READY_LED reflects the
+// current state of both sensors, not a one-time snapshot.
+bool imuValid = false;
+unsigned long lastImuValidityCheckMs = 0;
+
+// Re-checks IMU sanity every IMU_VALIDITY_CHECK_INTERVAL_MS. Catches a
+// sensor that was detected at boot but has since gone dead/disconnected
+// (which typically reads back all-zero or garbage), without requiring
+// the board to be held still.
+void updateImuValidity() {
+  if (!imuOk) {
+    imuValid = false;
+    return;
+  }
+
+  unsigned long now = millis();
+  if (now - lastImuValidityCheckMs < IMU_VALIDITY_CHECK_INTERVAL_MS) {
+    return;
+  }
+  lastImuValidityCheckMs = now;
+
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+
+  bool finiteReadings = isfinite(a.acceleration.x) && isfinite(a.acceleration.y) && isfinite(a.acceleration.z) &&
+                         isfinite(g.gyro.x) && isfinite(g.gyro.y) && isfinite(g.gyro.z);
+
+  float accelMag = sqrtf(a.acceleration.x * a.acceleration.x +
+                          a.acceleration.y * a.acceleration.y +
+                          a.acceleration.z * a.acceleration.z);
+  // Loose sanity range around gravity -- wide enough to allow for the
+  // board being handled/moved while you wait, tight enough to catch a
+  // dead sensor reading flat zero.
+  bool plausibleMagnitude = (accelMag > 1.0f && accelMag < 30.0f);
+
+  imuValid = finiteReadings && plausibleMagnitude;
+}
+
+// ---------- Logging heartbeat LED state ----------
+// Decoupled from individual GPS/IMU writes -- see header comment. We just
+// track "did anything get written this interval" and toggle on a fixed,
+// human-visible cadence.
 bool logLedOn = false;
-unsigned long logLedOnSinceMs = 0;
+unsigned long lastLogLedToggleMs = 0;
+bool dataWrittenSinceToggle = false;
 
-// ---------- Onboard LED ----------
-
-void flashLogLed() {
-  digitalWrite(LOG_LED_PIN, HIGH);
-  logLedOn = true;
-  logLedOnSinceMs = millis();
+void noteDataWritten() {
+  dataWrittenSinceToggle = true;
 }
 
 void serviceLogLed() {
-  if (logLedOn && (millis() - logLedOnSinceMs >= LOG_LED_FLASH_MS)) {
-    digitalWrite(LOG_LED_PIN, LOW);
+  unsigned long now = millis();
+  if (now - lastLogLedToggleMs < LOG_LED_BLINK_INTERVAL_MS) {
+    return;
+  }
+  lastLogLedToggleMs = now;
+
+  if (dataWrittenSinceToggle) {
+    // Data came in during this window -- keep the heartbeat blinking.
+    logLedOn = !logLedOn;
+  } else {
+    // Nothing was written this whole window -- go dark. A steady dark
+    // LED during a flight means writes have stalled.
     logLedOn = false;
+  }
+  digitalWrite(LOG_LED_PIN, logLedOn ? HIGH : LOW);
+  dataWrittenSinceToggle = false;
+}
+
+// ---------- Status LEDs (calibrate / upload / ready) ----------
+
+void allStatusLedsOff() {
+  digitalWrite(CALIBRATE_LED, LOW);
+  digitalWrite(UPLOAD_LED, LOW);
+  digitalWrite(READY_LED, LOW);
+}
+
+// READY_LED behavior while idle (waiting for the BOOT button):
+//   - no valid GPS fix yet        -> solid off (not ready to start)
+//   - valid GPS, no/invalid IMU   -> slow blink (can start, GPS-only)
+//   - valid GPS AND valid IMU     -> fast blink (can start, full data)
+// GPS is the hard requirement; IMU is a bonus (logging still works fine
+// without one, matching the GPS-only fallback elsewhere in this file).
+bool readyLedOn = false;
+unsigned long lastReadyLedToggleMs = 0;
+
+void serviceReadyLed(bool gpsValid, bool imuValidNow) {
+  if (!gpsValid) {
+    if (readyLedOn) {
+      readyLedOn = false;
+      digitalWrite(READY_LED, LOW);
+    }
+    return;
+  }
+
+  unsigned long interval = imuValidNow ? READY_LED_BLINK_FAST_MS : READY_LED_BLINK_SLOW_MS;
+  unsigned long now = millis();
+  if (now - lastReadyLedToggleMs >= interval) {
+    lastReadyLedToggleMs = now;
+    readyLedOn = !readyLedOn;
+    digitalWrite(READY_LED, readyLedOn ? HIGH : LOW);
+  }
+}
+
+// Blocking flash pattern -- only ever used at setup-time (calibration /
+// upload result), never inside the logging loop, so it's fine that it
+// blocks briefly.
+void flashLedBlocking(int pin, int times) {
+  for (int i = 0; i < times; i++) {
+    digitalWrite(pin, HIGH);
+    delay(STATUS_LED_FLASH_ON_MS);
+    digitalWrite(pin, LOW);
+    if (i < times - 1) {
+      delay(STATUS_LED_FLASH_OFF_MS);
+    }
   }
 }
 
@@ -238,6 +377,8 @@ void syncTime() {
 // ---------- Orientation filter helpers ----------
 
 void calibrateGyro() {
+  digitalWrite(CALIBRATE_LED, HIGH);
+
   const int samples = 500; // ~5s at 10ms per sample
   double sumX = 0, sumY = 0, sumZ = 0;
 
@@ -259,6 +400,8 @@ void calibrateGyro() {
   Serial.print("Initial gyro bias (rad/s) - X: "); Serial.print(gyroBiasX, 5);
   Serial.print("  Y: "); Serial.print(gyroBiasY, 5);
   Serial.print("  Z: "); Serial.println(gyroBiasZ, 5);
+
+  digitalWrite(CALIBRATE_LED, LOW);
 }
 
 // Call every IMU sample with raw (un-bias-corrected) readings. Detects
@@ -331,13 +474,27 @@ void startLogging() {
   lastImuWriteMs = now;
   lastFilterUpdateMs = now;
 
+  // Reset the logging heartbeat too.
+  lastLogLedToggleMs = now;
+  dataWrittenSinceToggle = false;
+  logLedOn = false;
+
+  // Reset the ready-LED blink state so it starts clean next time we're idle.
+  readyLedOn = false;
+  lastReadyLedToggleMs = now;
+
   loggingActive = true;
 
+  // Leaving the "waiting for button" state -- status LEDs turn off
+  // (READY_LED is the only one that should actually be lit at this
+  // point, the others are defensive).
+  allStatusLedsOff();
+
   // Explicit "logging started" confirmation -- solid on immediately,
-  // independent of the per-data-point heartbeat flash. The next
-  // flashLogLed() call (on the first GPS/IMU write) will take over
-  // the normal blip-per-point behavior from here.
+  // independent of the heartbeat blink. The heartbeat takes over from
+  // here as soon as serviceLogLed() runs in the main loop.
   digitalWrite(LOG_LED_PIN, HIGH);
+  logLedOn = true;
 
   Serial.println("Boot button pressed -- logging started.");
 }
@@ -361,7 +518,7 @@ void writeGpsFix(unsigned long nowMs) {
   f.print("\n");
   f.close();
 
-  flashLogLed();
+  noteDataWritten();
 }
 
 void writeImuSample(unsigned long nowMs) {
@@ -410,7 +567,7 @@ void writeImuSample(unsigned long nowMs) {
   f.print("\n");
   f.close();
 
-  flashLogLed();
+  noteDataWritten();
 }
 
 // ---------- Upload previous flight over WiFi ----------
@@ -418,6 +575,7 @@ void writeImuSample(unsigned long nowMs) {
 void uploadPendingFlight() {
   if (!LittleFS.exists(LOG_FILE_PATH)) {
     Serial.println("No pending flight file to upload.");
+    flashLedBlocking(UPLOAD_LED, 2);
     return;
   }
 
@@ -425,6 +583,7 @@ void uploadPendingFlight() {
   if (!f || f.size() == 0) {
     if (f) f.close();
     LittleFS.remove(LOG_FILE_PATH);
+    flashLedBlocking(UPLOAD_LED, 2);
     return;
   }
 
@@ -459,8 +618,13 @@ void uploadPendingFlight() {
   if (totalPoints == 0) {
     Serial.println("Log file had no valid points -- discarding.");
     LittleFS.remove(LOG_FILE_PATH);
+    flashLedBlocking(UPLOAD_LED, 2);
     return;
   }
+
+  // We now know there's a real upload to attempt -- UPLOAD_LED goes solid
+  // on for the duration of the network work, then flashes the result.
+  digitalWrite(UPLOAD_LED, HIGH);
 
   time_t nowT = time(nullptr);
   char isoTime[32];
@@ -477,6 +641,8 @@ void uploadPendingFlight() {
   f = LittleFS.open(LOG_FILE_PATH, "r");
   if (!f) {
     Serial.println("Could not reopen log file for upload.");
+    digitalWrite(UPLOAD_LED, LOW);
+    flashLedBlocking(UPLOAD_LED, 3);
     return;
   }
 
@@ -540,17 +706,21 @@ void uploadPendingFlight() {
   }
   f.close();
 
+  digitalWrite(UPLOAD_LED, LOW);
+
   if (!uploadFailed && flightId != -1) {
     Serial.printf("Upload complete: %u GPS, %u IMU, %u skipped (flight_id=%d)\n",
                   gpsStored, imuStored, skipped, flightId);
     Serial.println("Clearing local log.");
     LittleFS.remove(LOG_FILE_PATH);
+    flashLedBlocking(UPLOAD_LED, 1);
   } else {
     // NOTE: if some batches succeeded before one failed, those points are
     // already stored server-side. Retrying uploads the whole file again
     // next boot, which will re-send (and duplicate) those earlier batches.
     // Fine for a personal project; worth revisiting if that ever matters.
     Serial.println("Upload incomplete -- local log kept for retry next boot.");
+    flashLedBlocking(UPLOAD_LED, 3);
   }
 }
 
@@ -562,6 +732,11 @@ void setup() {
 
   pinMode(LOG_LED_PIN, OUTPUT);
   digitalWrite(LOG_LED_PIN, LOW);
+
+  pinMode(CALIBRATE_LED, OUTPUT);
+  pinMode(UPLOAD_LED, OUTPUT);
+  pinMode(READY_LED, OUTPUT);
+  allStatusLedsOff();
 
   pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
 
@@ -597,26 +772,47 @@ void setup() {
     Serial.println("No WiFi at boot -- logging locally only.");
   }
 
-  Serial.println("Ready. Press the BOOT button to start logging.");
+  Serial.println("Ready. Waiting for a valid GPS fix before the BOOT button will work.");
+  systemReady = true;
+  // READY_LED itself is now driven every loop() by serviceReadyLed(),
+  // based on live GPS/IMU validity rather than a one-time boot state.
 }
 
 // ---------- Main loop ----------
 
 void loop() {
-  if (!loggingActive) {
-    if (checkBootButtonPressed()) {
-      startLogging();
-    }
-    return; // idle -- nothing else to do until logging starts
-  }
-
+  // Keep feeding the GPS parser continuously -- even before logging
+  // starts -- so we know as soon as a fix comes in (and READY_LED can
+  // reflect it), rather than only reading GPS once already logging.
   while (GPSSerial.available() > 0) {
     gps.encode(GPSSerial.read());
   }
 
+  // Re-derived every loop, not just at boot: a fix older than
+  // GPS_STALE_MS (satellites lost) no longer counts as valid.
+  bool gpsValid = gps.location.isValid() && (gps.location.age() < GPS_STALE_MS);
+  updateImuValidity();
+
+  if (!loggingActive) {
+    serviceReadyLed(gpsValid, imuValid);
+
+    // Always service the debounce state machine so it doesn't build up
+    // a stale "pressed" edge from before a fix appeared -- but only
+    // actually start logging if we currently have a valid GPS fix.
+    bool buttonPressed = systemReady && checkBootButtonPressed();
+    if (buttonPressed) {
+      if (gpsValid) {
+        startLogging();
+      } else {
+        Serial.println("Button pressed but no valid GPS fix yet -- ignoring.");
+      }
+    }
+    return; // idle -- nothing else to do until logging starts
+  }
+
   unsigned long now = millis();
 
-  if (gps.location.isUpdated() && gps.location.isValid()) {
+  if (gps.location.isUpdated() && gpsValid) {
     if (now - lastGpsWriteMs >= GPS_MIN_INTERVAL_MS) {
       writeGpsFix(now);
       lastGpsWriteMs = now;

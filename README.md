@@ -15,6 +15,7 @@ No flight controller. No telemetry radio. Just an ESP32, a GPS module, and an IM
 ## Table of contents
 
 - [How it works](#how-it-works)
+- [Status LEDs](#status-leds)
 - [Hardware](#hardware)
 - [Repo layout](#repo-layout)
 - [1 · Firmware setup](#1--firmware-setup)
@@ -30,19 +31,38 @@ No flight controller. No telemetry radio. Just an ESP32, a GPS module, and an IM
 
 ```mermaid
 flowchart TD
-    A["ESP32 + GPS + IMU<br/>(idle, waiting to arm)"] -->|"press BOOT button"| B["Logging to flash<br/>(LittleFS, JSONL)"]
+    A["ESP32 + GPS + IMU<br/>(idle, waiting to arm)"] -->|"press BOOT button<br/>(only honored with a valid GPS fix)"| B["Logging to flash<br/>(LittleFS, JSONL)"]
     B -->|"land, power-cycle near WiFi"| C["Chunked HTTP POST upload<br/>(150 pts/batch, API-keyed)"]
     C --> D["FastAPI ground station (Pi)<br/>reconstructs real UTC timestamps → SQLite"]
     D --> E["Web dashboard<br/>2D map · 3D path · HUD instruments · scrub-to-replay timeline"]
     C -.->|"next flight"| A
 ```
 
-1. **On boot**, the ESP32 tries WiFi for a few seconds. If it connects, it syncs real time over NTP and uploads any flight log left over from the last flight — then clears it.
-2. It then sits idle until the **BOOT button (GPIO0)** is pressed, so no logging time is wasted during the WiFi/NTP window.
-3. Once armed, it logs **GPS fixes (~5 Hz)** and **IMU samples (~50 Hz)** as interleaved JSONL to onboard flash, timestamped with milliseconds-since-boot — no live clock needed in the air. An onboard LED flashes once per point written as a logging heartbeat.
+1. **On boot**, the ESP32 tries WiFi for a few seconds. If it connects, it syncs real time over NTP and uploads any flight log left over from the last flight — then clears it. A dedicated **CALIBRATE_LED** and **UPLOAD_LED** give a visual readout of each of these boot-time stages; see [Status LEDs](#status-leds).
+2. It then sits idle, waiting for the **BOOT button (GPIO0)** to arm logging — but the button only actually does anything once there's a **valid GPS fix**. The **READY_LED** communicates this live: off with no fix, slow-blinking once GPS alone is good, fast-blinking once GPS *and* the IMU are both good to go.
+3. Once armed, it logs **GPS fixes (~5 Hz)** and **IMU samples (~50 Hz)** as interleaved JSONL to onboard flash, timestamped with milliseconds-since-boot — no live clock needed in the air. A separate onboard heartbeat LED confirms data is actively being written (see [Status LEDs](#status-leds) — this replaced an earlier per-point flash that was too fast to see).
 4. Orientation (roll/pitch/yaw) is computed **on the ESP32 itself** via a quaternion-based Madgwick AHRS filter, with continuous gyro-bias learning to track thermal drift.
 5. Back near WiFi, the whole flight uploads in small batches to avoid ESP32 heap exhaustion, and the **FastAPI backend** reconstructs true UTC timestamps by anchoring each point to the batch's known first/last millisecond offsets.
 6. The **web dashboard** — served straight off the Raspberry Pi — renders the flight path on a 2D Leaflet map and a 3D Three.js scene, with a HUD of altitude/speed tapes, an attitude indicator, GPS/battery/vibration readouts, and a scrub-to-replay timeline.
+
+---
+
+## Status LEDs
+
+Four onboard LEDs give a full at-a-glance readout of firmware state without needing a serial monitor connected.
+
+| LED | Pin | Meaning |
+|---|---|---|
+| **CALIBRATE_LED** | GPIO32 | On solid for the ~5s gyro bias calibration at boot (board must stay still). Off once done. Only runs if an IMU is detected. |
+| **UPLOAD_LED** | GPIO33 | On solid while a pending flight log is actively uploading over WiFi. When finished: **1 flash** = uploaded successfully, **2 flashes** = checked and there was nothing pending, **3 flashes** = upload failed (log kept on flash for retry next boot). |
+| **READY_LED** | GPIO25 | Reflects live GPS/IMU status while idle, rechecked continuously (not just once at boot): **off** = no valid GPS fix yet, BOOT button is ignored · **slow blink** (~1.25 Hz) = valid GPS, no/invalid IMU — safe to arm, GPS-only · **fast blink** (~4 Hz) = valid GPS *and* valid IMU — everything's good. |
+| **Onboard LED (heartbeat)** | GPIO2 | While logging, toggles on a fixed, clearly-visible ~400ms cadence, but *only* if at least one GPS/IMU point was actually written since the last toggle. Steady blinking = data is flowing normally; if it stops blinking and goes dark mid-flight, writes have stalled (lost GPS fix and no IMU). |
+
+All three status LEDs (CALIBRATE_LED, UPLOAD_LED, READY_LED) turn off the moment logging starts, since only the heartbeat LED is relevant once armed.
+
+> **Why the heartbeat LED changed:** the original implementation flashed once per data point written. That works fine for GPS at ~5 Hz, but IMU samples arrive every ~20ms (50 Hz) — far faster than the LED can visibly turn on and off, and faster than the eye can resolve as discrete flashes anyway. It now tracks "was *any* point written in the last ~400ms" and toggles on that fixed interval instead, which is both visible and still an accurate live indicator that logging hasn't silently stalled.
+
+> **Why the BOOT button now requires a GPS fix:** previously the button worked as soon as setup finished, even with zero satellites in view, silently starting a flight log that might be GPS-less for a while. GPS fix validity (including a staleness check — a fix older than 3s no longer counts) and IMU sanity (finite, plausible-magnitude readings, rechecked every 200ms) are now both tracked continuously while idle, and only a valid GPS fix is required to arm — IMU is a bonus indicator (fast vs. slow blink) since logging still works fine GPS-only if no IMU is installed.
 
 ---
 
@@ -66,11 +86,14 @@ flowchart TD
 | IMU SDA → ESP32 | GPIO4 |
 | IMU SCL → ESP32 | GPIO5 |
 | Onboard LED (heartbeat) | GPIO2 |
+| CALIBRATE_LED | GPIO32 |
+| UPLOAD_LED | GPIO33 |
+| READY_LED | GPIO25 |
 | Arm/start logging | GPIO0 (BOOT button) |
 
 > A full pinout reference is included at [`ESP32 Pinout.jpg`](./ESP32%20Pinout.jpg).
 
-> ⚠️ **GPIO5 is claimed by the IMU.** If you're wiring in the microSD breakout, use **GPIO15** or **GPIO33** for chip-select instead.
+> ⚠️ **GPIO5 is claimed by the IMU, and GPIO32/33/25 are now claimed by the status LEDs.** If you're wiring in the microSD breakout, use **GPIO15** for chip-select instead — GPIO33 was previously a candidate but now conflicts with UPLOAD_LED (see [Roadmap](#roadmap)).
 
 ---
 
@@ -129,7 +152,7 @@ Edit `firmware/secrets.h`:
 
 **Build & flash**
 
-Open the folder in VS Code with the PlatformIO extension, select the `esp32dev` environment, and upload. On boot the ESP32 will attempt WiFi, sync time, and try to upload any pending flight — then wait for the BOOT button to arm logging for the next flight.
+Open the folder in VS Code with the PlatformIO extension, select the `esp32dev` environment, and upload. On boot the ESP32 will attempt WiFi, sync time, and try to upload any pending flight — then wait for a valid GPS fix and the BOOT button to arm logging for the next flight. Wire up the four [status LEDs](#status-leds) if you want the visual feedback described above; the firmware runs fine without them, they just won't light up.
 
 **Diagnostics**
 
@@ -209,6 +232,7 @@ sudo systemctl enable --now drone-logger.service
 
 - Find the Pi's LAN IP (`hostname -I`) and make sure it matches `SERVER_URL` in `firmware/secrets.h`; the Pi's firewall must allow inbound connections on port 8000.
 - [Tailscale](https://tailscale.com) is configured on the Pi for remote access without exposing it to the open internet — handy for pulling flights off-site, or using **Tailscale Funnel** to share a live demo publicly.
+- If the ESP32's `UPLOAD_LED` flashes 3 times (upload failed) right after boot, HTTP status `-1` from the firmware's serial log means the ESP32 couldn't establish a TCP connection at all — check that the FastAPI server is actually running, `SERVER_URL` has the current correct IP/port, the server is bound to `0.0.0.0` (not `127.0.0.1`), and the ESP32 and Pi are on the same network.
 
 ---
 
@@ -248,7 +272,9 @@ Split into two tables specifically so neither ends up mostly-NULL from the other
 Lessons learned the hard way, kept here so they don't get re-learned:
 
 - **Heap exhaustion is the #1 upload risk on the ESP32.** Building one giant `JsonDocument` + serialized `String` for an entire flight can eat 300KB+ of RAM and starve the lwIP TCP buffers mid-upload. Fixed by uploading in **150-point batches**, each pre-scanned once for the flight's global first/last timestamp so every batch reconstructs real time consistently regardless of upload order.
-- **GPIO5 is taken by the IMU** — exclude it from any future SPI chip-select assignment.
+- **A per-data-point LED flash is invisible at IMU sample rates.** Flashing the heartbeat LED once per write looked fine at ~5 Hz GPS but was functionally useless at ~50 Hz IMU — 20ms between writes doesn't leave enough time for a flash to be visibly on and off. Decoupled the LED from write cadence entirely: it now toggles on a fixed ~400ms interval, gated on whether *any* point was written since the last toggle, which is both visible and still an honest "logging is/isn't happening" signal.
+- **HTTP `-1` from the ESP32 `HTTPClient` isn't a real status code** — it's `HTTPC_ERROR_CONNECTION_REFUSED`, meaning the TCP connection itself failed (server not running/reachable), not an application-level error from the backend. Worth checking `SERVER_URL`, server bind address, and network reachability before assuming it's a FastAPI bug.
+- **GPIO5 is taken by the IMU, and GPIO32/33/25 are taken by the status LEDs** — exclude all of these from any future SPI chip-select assignment (see the SD card roadmap item below).
 - **NMEA sentences flowing ≠ a good fix.** A GPS module reporting `V` status / fix quality `0` usually means "can't see enough sky," not "hardware is broken." The `GPSTest`/`GPSFix` diagnostic builds exist specifically to tell these apart.
 - **SQLite foreign keys don't cascade by default.** `PRAGMA foreign_keys` has to be set per-connection, and the backend doesn't rely on it — flight deletion explicitly removes child rows from `telemetry_points`/`imu_points` before the parent `flights` row.
 - **`systemd`'s `User=` must match your actual account**, not an assumed default like `pi` — and `WorkingDirectory`/`ExecStart` paths need to agree with wherever the repo actually lives on the Pi.
@@ -258,9 +284,10 @@ Lessons learned the hard way, kept here so they don't get re-learned:
 
 ## Roadmap
 
-- [ ] **SD card storage migration** — swap `LittleFS.open()` → `SD.open()` for the flight log, using an SPI microSD breakout (candidate CS pin: GPIO15 or GPIO33). Existing JSONL logging and chunked-upload logic should carry over largely unchanged.
+- [ ] **SD card storage migration** — swap `LittleFS.open()` → `SD.open()` for the flight log, using an SPI microSD breakout (candidate CS pin: **GPIO15** — GPIO33 is no longer available, it's now UPLOAD_LED). Existing JSONL logging and chunked-upload logic should carry over largely unchanged.
 - [ ] **Benchmark SD write latency** ahead of pushing IMU sampling past 50 Hz toward 100 Hz+.
 - [ ] **Offline map tiles** — the dashboard's JS/CSS is fully self-hosted, but map tiles still stream live from OpenStreetMap; no offline tile cache yet.
+- [ ] **GPS module fix-rate configuration** — the NEO-6M defaults to outputting fixes at 1Hz regardless of how often the firmware polls it; a `UBX-CFG-RATE` command to raise the module's own output to 5Hz was drafted but not adopted yet.
 
 ---
 
