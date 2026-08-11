@@ -13,7 +13,12 @@
     5. Reads GPS continuously and appends a line to the log file for every
        new fix, using milliseconds-since-boot as the timestamp (no live
        clock needed while flying).
-    6. If WiFi never connects, it just keeps logging locally -- nothing is
+    6. On a SECOND button press (while a flight is actively being logged):
+       stops logging, turns the log LED off, and tries to upload right
+       away over the still-open WiFi connection from boot -- rather than
+       requiring a reboot to trigger the upload. Falls back to "kept for
+       next boot" (3 UPLOAD_LED flashes) if WiFi isn't connected.
+    7. If WiFi never connects, it just keeps logging locally -- nothing is
        lost. The file uploads next time it boots near WiFi.
 
   Status LEDs:
@@ -724,6 +729,38 @@ void uploadPendingFlight() {
   }
 }
 
+// Called when the boot button is pressed a second time, while a flight is
+// already being logged. GPS/IMU writes already close the file after every
+// single append (see writeGpsFix()/writeImuSample()), so there's no
+// dangling file handle to clean up here -- but ending the session
+// explicitly, rather than just power-cycling the board, gives you a clear
+// "logging stopped" confirmation and lets us try uploading immediately
+// instead of waiting for the next boot.
+void stopLogging() {
+  loggingActive = false;
+
+  digitalWrite(LOG_LED_PIN, LOW);
+  logLedOn = false;
+
+  Serial.println("Boot button pressed again -- logging stopped.");
+
+  // WiFi was connected once at boot and never explicitly disconnected, so
+  // if it's still up we can upload right now instead of waiting for the
+  // next power cycle.
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("Attempting immediate upload...");
+    uploadPendingFlight();
+  } else {
+    Serial.println("No WiFi connection -- flight log kept on flash for upload next boot.");
+    flashLedBlocking(UPLOAD_LED, 3);
+  }
+
+  // Reset ready-LED / debounce bookkeeping so the idle state starts clean
+  // in case you want to start a new flight log right after this one.
+  readyLedOn = false;
+  lastReadyLedToggleMs = millis();
+}
+
 // ---------- Setup ----------
 
 void setup() {
@@ -808,6 +845,14 @@ void loop() {
       }
     }
     return; // idle -- nothing else to do until logging starts
+  }
+
+  // Still service the debounce state machine while a flight is being
+  // logged, so a second press can end the session cleanly and trigger an
+  // immediate upload instead of requiring a reboot.
+  if (systemReady && checkBootButtonPressed()) {
+    stopLogging();
+    return;
   }
 
   unsigned long now = millis();
