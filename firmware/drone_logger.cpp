@@ -148,11 +148,9 @@ const unsigned long LOG_CMD_ACK_TIMEOUT_MS = 2000; // START/STOP handshake with 
 #define I2C_SCL_PIN 5
 
 // SD card SPI pins -- verified working combination from SDSpeedTest.cpp.
-// GPIO15 (strapping/JTAG pin) caused a task hang under sustained writes
-// and GPIO22 is one of the two damaged pins on this board (with 21) --
-// avoid both. 4MHz is a conservative, verified-stable clock; the
-// breadboard connection showed some instability at 20MHz in earlier
-// testing, so re-verify carefully with SDSpeedTest.cpp before raising it.
+// GPIO15 (strapping/JTAG pin) works fine here for chip-select. GPIO22 is
+// one of the two damaged pins on this board (with 21) -- avoid it.
+// 20MHz has been confirmed stable in practice with this wiring.
 #define SD_CS 15
 #define SD_SCK 18
 #define SD_MISO 19
