@@ -296,7 +296,6 @@ Lessons learned the hard way, kept here so they don't get re-learned:
 ## Roadmap
 
 - [x] **SD card storage migration** — flight logs now write to a 16GB SD card over SPI instead of internal flash, via a dedicated writer task (`SD.open()`/dual-task queue architecture, see [Design notes](#design-notes--gotchas)) rather than a straight `LittleFS` → `SD` swap.
-- [ ] **Clean up the stale SD pin/clock warning comment** in `drone_logger.cpp` — the comment above `SD_CS`/`SPI_SD_FREQ_HZ` still says GPIO15 caused task hangs and that 4MHz was the verified-stable clock, but GPIO15 at 20MHz is what's actually in use and confirmed working. Comment just needs updating to match reality so it doesn't mislead the next read-through.
 - [ ] **Benchmark SD write latency at higher IMU rates** ahead of pushing sampling past 50 Hz toward 100 Hz+ — `SDSpeedTest.cpp` exists for this, but hasn't been run against the current batch-flush settings.
 - [ ] **Offline map tiles** — the dashboard's JS/CSS is fully self-hosted, but map tiles still stream live from OpenStreetMap; no offline tile cache yet.
 - [ ] **GPS module fix-rate configuration** — the NEO-6M defaults to outputting fixes at 1Hz regardless of how often the firmware polls it; a `UBX-CFG-RATE` command to raise the module's own output to 5Hz was drafted but not adopted yet.
