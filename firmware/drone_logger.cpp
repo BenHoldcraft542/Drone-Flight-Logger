@@ -4,11 +4,11 @@
   What it does:
     1. On boot, tries to join WiFi for a few seconds.
     2. If WiFi connects: gets the current time via NTP, uploads any flight
-       log left over from the last flight (saved on flash), then deletes it.
+       log left over from the last flight (saved on the SD card), then deletes it.
     3. Waits idle for the BOOT button (GPIO0) to be pressed. Nothing is
        logged until then -- this avoids wasting the WiFi-timeout / NTP
        window at the start of your actual flight log.
-    4. On button press: starts a new flight log file on flash (LittleFS)
+    4. On button press: starts a new flight log file on the SD card
        and turns the LED on as an explicit "logging started" confirmation.
     5. Reads GPS continuously and appends a line to the log file for every
        new fix, using milliseconds-since-boot as the timestamp (no live
@@ -62,7 +62,7 @@
   Libraries needed (install via Arduino Library Manager):
     - TinyGPSPlus by Mikal Hart
     - ArduinoJson by Benoit Blanchon
-    (WiFi, HTTPClient, LittleFS, time.h are built into the ESP32 core)
+    (WiFi, HTTPClient, SPI, SD, time.h are built into the ESP32 core)
 
   Adding an IMU later: add roll/pitch/yaw fields to the JSON object built
   in writeFix() and the payload built in uploadPendingFlight() -- the
@@ -79,7 +79,8 @@
 
 #include <WiFi.h>
 #include <HTTPClient.h>
-#include <LittleFS.h>
+#include <SPI.h>
+#include <SD.h>
 #include <TinyGPSPlus.h>
 #include <ArduinoJson.h>
 #include <time.h>
@@ -88,6 +89,35 @@
 #include <Adafruit_Sensor.h>
 #include <math.h>
 #include "secrets.h"
+
+/*
+  SD card + dual-task logging architecture
+  ------------------------------------------------------------------------
+  Logging now runs as two FreeRTOS tasks instead of writing to flash
+  directly from the main loop:
+
+    - Core 1 (Arduino's default loop() core): samples GPS/IMU, runs the
+      Madgwick filter, and pushes each sample as a pre-serialized JSON
+      line onto logQueue. Never touches SD/SPI directly, so a slow SD
+      write can never stall sampling.
+
+    - Core 0 (sdWriterTask): owns the SD card and the open flight-log
+      file exclusively. Pulls lines off logQueue and writes them,
+      flushing every SD_FLUSH_BATCH_SIZE samples rather than after
+      every single write (open/close-per-sample was the slow path in
+      SDSpeedTest.cpp -- batching is where the real throughput is).
+
+  Queue items are a fixed-size struct (not a String) so they can be
+  safely memcpy'd across the queue without heap ownership issues. START
+  and STOP commands travel through the same queue as data lines, which
+  guarantees ordering -- a STOP_FLIGHT can never be processed before
+  data lines that were enqueued ahead of it.
+
+  Trade-off vs. the old open-per-sample approach: a crash can now lose
+  up to SD_FLUSH_BATCH_SIZE unflushed samples instead of at most one.
+  With a small batch size this is a small, deliberate trade for faster,
+  less wear-inducing writes.
+*/
 
 // ---------- CONFIG ----------
 const unsigned long WIFI_CONNECT_TIMEOUT_MS   = 8000;
@@ -101,12 +131,33 @@ const unsigned long GPS_STALE_MS              = 3000;  // fix older than this co
 const unsigned long IMU_VALIDITY_CHECK_INTERVAL_MS = 200; // how often to re-sanity-check the IMU while idle
 const unsigned long READY_LED_BLINK_SLOW_MS   = 500;   // GPS valid, IMU not (or not installed)
 const unsigned long READY_LED_BLINK_FAST_MS   = 120;   // GPS + IMU both valid -- good to go
+
+// SD writer task tuning. 15 was chosen as a "small batch" -- a crash
+// loses at most ~15 unflushed samples (well under 1s of IMU data at
+// 50Hz) while still avoiding the much slower open/write/close-per-
+// sample pattern measured in SDSpeedTest.cpp.
+const int SD_FLUSH_BATCH_SIZE  = 15;
+const int LOG_QUEUE_LENGTH     = 128;  // samples buffered between the two tasks
+const int LOG_LINE_MAX_LEN     = 220;  // generous headroom over the largest IMU line
+const unsigned long LOG_CMD_ACK_TIMEOUT_MS = 2000; // START/STOP handshake with the writer task
 // -----------------------------------------
 
 #define GPS_RX_PIN 16
 #define GPS_TX_PIN 17
 #define I2C_SDA_PIN 4
 #define I2C_SCL_PIN 5
+
+// SD card SPI pins -- verified working combination from SDSpeedTest.cpp.
+// GPIO15 (strapping/JTAG pin) caused a task hang under sustained writes
+// and GPIO22 is one of the two damaged pins on this board (with 21) --
+// avoid both. 4MHz is a conservative, verified-stable clock; the
+// breadboard connection showed some instability at 20MHz in earlier
+// testing, so re-verify carefully with SDSpeedTest.cpp before raising it.
+#define SD_CS 15
+#define SD_SCK 18
+#define SD_MISO 19
+#define SD_MOSI 23
+#define SPI_SD_FREQ_HZ 20000000
 
 #define CALIBRATE_LED 32
 #define UPLOAD_LED 33
@@ -214,6 +265,134 @@ const char* LOG_FILE_PATH = "/flight_log.jsonl";
 unsigned long lastGpsWriteMs = 0;
 unsigned long lastImuWriteMs = 0;
 
+// ---------- Dual-task logging: queue + writer task plumbing ----------
+
+enum class LogCmd : uint8_t { DATA, START_FLIGHT, STOP_FLIGHT };
+
+struct LogQueueItem {
+  LogCmd cmd;
+  char line[LOG_LINE_MAX_LEN]; // only populated when cmd == DATA
+};
+
+QueueHandle_t logQueue = nullptr;
+TaskHandle_t sdWriterTaskHandle = nullptr;
+
+// Signaled by sdWriterTask after it finishes handling START_FLIGHT or
+// STOP_FLIGHT, so the main loop can wait for the file to actually be
+// open (or actually be closed and flushed) before proceeding -- e.g.
+// uploadPendingFlight() must never run until the writer has confirmed
+// the file is closed.
+SemaphoreHandle_t logCmdAckSemaphore = nullptr;
+
+// Set by sdWriterTask, read by the main loop's serviceLogLed(). Just a
+// status-LED flag (not safety-critical data), so a plain volatile bool
+// is sufficient here rather than a mutex.
+volatile bool dataWrittenSinceToggle_writer = false;
+
+// Set by sdWriterTask after processing START_FLIGHT, so the caller can
+// tell whether the file actually opened successfully.
+volatile bool sdWriteFileOpen = false;
+
+// Counts samples dropped because the queue was full (writer falling
+// behind). Logged periodically rather than on every drop to avoid
+// flooding Serial.
+volatile unsigned long droppedSampleCount = 0;
+unsigned long lastDroppedSampleReportMs = 0;
+const unsigned long DROPPED_SAMPLE_REPORT_INTERVAL_MS = 5000;
+
+// Sends a START_FLIGHT or STOP_FLIGHT command to the writer task and
+// blocks (briefly) until the writer acknowledges it's done -- this is
+// what guarantees the file is genuinely open before logging starts, and
+// genuinely closed/flushed before an upload attempt reads it back.
+void sendLogCommandAndWait(LogCmd cmd) {
+  LogQueueItem item;
+  item.cmd = cmd;
+  xQueueSend(logQueue, &item, portMAX_DELAY);
+
+  if (xSemaphoreTake(logCmdAckSemaphore, pdMS_TO_TICKS(LOG_CMD_ACK_TIMEOUT_MS)) != pdTRUE) {
+    Serial.println("WARNING: SD writer task did not acknowledge command in time.");
+  }
+}
+
+// Runs on core 0. Owns the SD card and the flight-log file handle
+// exclusively -- nothing else in this firmware touches SD/SPI.
+void sdWriterTask(void* param) {
+  File f;
+  bool fileOpen = false;
+  int samplesSinceFlush = 0;
+
+  for (;;) {
+    LogQueueItem item;
+    if (xQueueReceive(logQueue, &item, portMAX_DELAY) != pdTRUE) {
+      continue;
+    }
+
+    switch (item.cmd) {
+      case LogCmd::START_FLIGHT: {
+        if (fileOpen) { // defensive -- shouldn't happen given command ordering
+          f.close();
+          fileOpen = false;
+        }
+        SD.remove(LOG_FILE_PATH); // start each flight with a fresh file
+        f = SD.open(LOG_FILE_PATH, FILE_WRITE);
+        fileOpen = (bool)f;
+        samplesSinceFlush = 0;
+        sdWriteFileOpen = fileOpen;
+        if (!fileOpen) {
+          Serial.println("SD writer: failed to open flight log file for writing!");
+        }
+        xSemaphoreGive(logCmdAckSemaphore);
+        break;
+      }
+
+      case LogCmd::STOP_FLIGHT: {
+        if (fileOpen) {
+          f.flush();
+          f.close();
+          fileOpen = false;
+        }
+        sdWriteFileOpen = false;
+        xSemaphoreGive(logCmdAckSemaphore);
+        break;
+      }
+
+      case LogCmd::DATA: {
+        if (fileOpen) {
+          f.print(item.line);
+          samplesSinceFlush++;
+          dataWrittenSinceToggle_writer = true;
+          if (samplesSinceFlush >= SD_FLUSH_BATCH_SIZE) {
+            f.flush();
+            samplesSinceFlush = 0;
+          }
+        }
+        break;
+      }
+    }
+  }
+}
+
+// Serializes a JsonDocument into a queue item and enqueues it. Uses a
+// short timeout rather than blocking indefinitely, so a momentarily
+// full queue (writer briefly behind) can never stall sampling -- the
+// sample is dropped and counted instead.
+void enqueueLogLine(JsonDocument& doc) {
+  LogQueueItem item;
+  item.cmd = LogCmd::DATA;
+
+  size_t written = serializeJson(doc, item.line, sizeof(item.line) - 2);
+  if (written == 0 || written >= sizeof(item.line) - 2) {
+    Serial.println("WARNING: log line too long for buffer, dropping sample.");
+    return;
+  }
+  item.line[written] = '\n';
+  item.line[written + 1] = '\0';
+
+  if (xQueueSend(logQueue, &item, pdMS_TO_TICKS(5)) != pdTRUE) {
+    droppedSampleCount++;
+  }
+}
+
 // Logging only actually starts once the boot button is pressed -- avoids
 // wasting the WiFi-timeout / NTP-sync window at the start of the flight log.
 bool loggingActive = false;
@@ -271,11 +450,13 @@ void updateImuValidity() {
 // human-visible cadence.
 bool logLedOn = false;
 unsigned long lastLogLedToggleMs = 0;
-bool dataWrittenSinceToggle = false;
 
-void noteDataWritten() {
-  dataWrittenSinceToggle = true;
-}
+// NOTE: the actual "was anything written" flag is now
+// dataWrittenSinceToggle_writer, set by sdWriterTask (declared above,
+// near the queue plumbing) since that's the task that knows whether SD
+// writes are really happening -- not just whether samples are being
+// enqueued. This preserves the original guarantee: if the LED stops
+// blinking mid-flight, writes have genuinely stalled, not just sampling.
 
 void serviceLogLed() {
   unsigned long now = millis();
@@ -284,8 +465,9 @@ void serviceLogLed() {
   }
   lastLogLedToggleMs = now;
 
-  if (dataWrittenSinceToggle) {
-    // Data came in during this window -- keep the heartbeat blinking.
+  if (dataWrittenSinceToggle_writer) {
+    // Data was actually written to SD during this window -- keep the
+    // heartbeat blinking.
     logLedOn = !logLedOn;
   } else {
     // Nothing was written this whole window -- go dark. A steady dark
@@ -293,7 +475,7 @@ void serviceLogLed() {
     logLedOn = false;
   }
   digitalWrite(LOG_LED_PIN, logLedOn ? HIGH : LOW);
-  dataWrittenSinceToggle = false;
+  dataWrittenSinceToggle_writer = false;
 }
 
 // ---------- Status LEDs (calibrate / upload / ready) ----------
@@ -459,18 +641,17 @@ bool checkBootButtonPressed() {
 
 // ---------- Flight file handling ----------
 
-void startNewFlightLog() {
-  File f = LittleFS.open(LOG_FILE_PATH, "w");
-  if (f) {
-    f.close();
+void startLogging() {
+  // Hands file creation off to sdWriterTask and blocks briefly for its
+  // acknowledgement -- so by the time this returns, either the file is
+  // genuinely open on the SD card, or sdWriteFileOpen is false and
+  // we've already logged a warning about it.
+  sendLogCommandAndWait(LogCmd::START_FLIGHT);
+  if (sdWriteFileOpen) {
     Serial.println("New flight log started.");
   } else {
-    Serial.println("Failed to create flight log file!");
+    Serial.println("Failed to create flight log file! Logging will be lost.");
   }
-}
-
-void startLogging() {
-  startNewFlightLog();
 
   // Reset write timers so we don't get a burst of "overdue" writes on
   // the first loop iteration after starting.
@@ -481,7 +662,7 @@ void startLogging() {
 
   // Reset the logging heartbeat too.
   lastLogLedToggleMs = now;
-  dataWrittenSinceToggle = false;
+  dataWrittenSinceToggle_writer = false;
   logLedOn = false;
 
   // Reset the ready-LED blink state so it starts clean next time we're idle.
@@ -514,16 +695,7 @@ void writeGpsFix(unsigned long nowMs) {
   doc["sats"] = gps.satellites.isValid() ? gps.satellites.value() : -1;
   doc["hdop"] = gps.hdop.isValid() ? gps.hdop.hdop() : (double)NAN;
 
-  File f = LittleFS.open(LOG_FILE_PATH, "a");
-  if (!f) {
-    Serial.println("Could not open log file for append.");
-    return;
-  }
-  serializeJson(doc, f);
-  f.print("\n");
-  f.close();
-
-  noteDataWritten();
+  enqueueLogLine(doc);
 }
 
 void writeImuSample(unsigned long nowMs) {
@@ -563,31 +735,22 @@ void writeImuSample(unsigned long nowMs) {
   doc["pitch"] = orientationFilter.getPitch();
   doc["yaw"] = orientationFilter.getYaw();
 
-  File f = LittleFS.open(LOG_FILE_PATH, "a");
-  if (!f) {
-    Serial.println("Could not open log file for append.");
-    return;
-  }
-  serializeJson(doc, f);
-  f.print("\n");
-  f.close();
-
-  noteDataWritten();
+  enqueueLogLine(doc);
 }
 
 // ---------- Upload previous flight over WiFi ----------
 
 void uploadPendingFlight() {
-  if (!LittleFS.exists(LOG_FILE_PATH)) {
+  if (!SD.exists(LOG_FILE_PATH)) {
     Serial.println("No pending flight file to upload.");
     flashLedBlocking(UPLOAD_LED, 2);
     return;
   }
 
-  File f = LittleFS.open(LOG_FILE_PATH, "r");
+  File f = SD.open(LOG_FILE_PATH, FILE_READ);
   if (!f || f.size() == 0) {
     if (f) f.close();
-    LittleFS.remove(LOG_FILE_PATH);
+    SD.remove(LOG_FILE_PATH);
     flashLedBlocking(UPLOAD_LED, 2);
     return;
   }
@@ -622,7 +785,7 @@ void uploadPendingFlight() {
 
   if (totalPoints == 0) {
     Serial.println("Log file had no valid points -- discarding.");
-    LittleFS.remove(LOG_FILE_PATH);
+    SD.remove(LOG_FILE_PATH);
     flashLedBlocking(UPLOAD_LED, 2);
     return;
   }
@@ -643,7 +806,7 @@ void uploadPendingFlight() {
   // each batch's JsonDocument/String small and short-lived (freed at the
   // end of each loop iteration) avoids the heap exhaustion that a single
   // huge payload for the whole flight can cause.
-  f = LittleFS.open(LOG_FILE_PATH, "r");
+  f = SD.open(LOG_FILE_PATH, FILE_READ);
   if (!f) {
     Serial.println("Could not reopen log file for upload.");
     digitalWrite(UPLOAD_LED, LOW);
@@ -717,7 +880,7 @@ void uploadPendingFlight() {
     Serial.printf("Upload complete: %u GPS, %u IMU, %u skipped (flight_id=%d)\n",
                   gpsStored, imuStored, skipped, flightId);
     Serial.println("Clearing local log.");
-    LittleFS.remove(LOG_FILE_PATH);
+    SD.remove(LOG_FILE_PATH);
     flashLedBlocking(UPLOAD_LED, 1);
   } else {
     // NOTE: if some batches succeeded before one failed, those points are
@@ -730,17 +893,33 @@ void uploadPendingFlight() {
 }
 
 // Called when the boot button is pressed a second time, while a flight is
-// already being logged. GPS/IMU writes already close the file after every
-// single append (see writeGpsFix()/writeImuSample()), so there's no
-// dangling file handle to clean up here -- but ending the session
-// explicitly, rather than just power-cycling the board, gives you a clear
-// "logging stopped" confirmation and lets us try uploading immediately
-// instead of waiting for the next boot.
+// already being logged. Ending the session explicitly, rather than just
+// power-cycling the board, gives you a clear "logging stopped"
+// confirmation and lets us try uploading immediately instead of waiting
+// for the next boot.
+//
+// IMPORTANT: with the dual-task architecture, GPS/IMU writes are no
+// longer closed synchronously after every sample -- the writer task may
+// still have queued lines to flush and the file to close. Sending
+// STOP_FLIGHT through the *same* queue as data lines guarantees it's
+// processed only after every line enqueued before it, and
+// sendLogCommandAndWait() blocks here until the writer confirms the
+// file is actually closed. Without that wait, uploadPendingFlight()
+// could race the writer task and read a partially-written or
+// still-open file.
 void stopLogging() {
   loggingActive = false;
 
   digitalWrite(LOG_LED_PIN, LOW);
   logLedOn = false;
+
+  sendLogCommandAndWait(LogCmd::STOP_FLIGHT);
+
+  if (droppedSampleCount > 0) {
+    Serial.printf("Note: %lu samples were dropped during this flight (writer fell behind).\n",
+                  droppedSampleCount);
+    droppedSampleCount = 0;
+  }
 
   Serial.println("Boot button pressed again -- logging stopped.");
 
@@ -751,7 +930,7 @@ void stopLogging() {
     Serial.println("Attempting immediate upload...");
     uploadPendingFlight();
   } else {
-    Serial.println("No WiFi connection -- flight log kept on flash for upload next boot.");
+    Serial.println("No WiFi connection -- flight log kept on SD card for upload next boot.");
     flashLedBlocking(UPLOAD_LED, 3);
   }
 
@@ -777,10 +956,27 @@ void setup() {
 
   pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
 
-  if (!LittleFS.begin(true)) {
-    Serial.println("LittleFS mount failed. Halting.");
+  SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+  if (!SD.begin(SD_CS, SPI, SPI_SD_FREQ_HZ)) {
+    Serial.println("SD card mount failed. Check wiring and CS pin. Halting.");
     while (true) delay(1000);
   }
+
+  // Dual-task logging setup. Must happen before anything can call
+  // startLogging() (which uses logQueue/logCmdAckSemaphore) -- loop()
+  // doesn't start until setup() returns, so creating these here is safe.
+  logQueue = xQueueCreate(LOG_QUEUE_LENGTH, sizeof(LogQueueItem));
+  logCmdAckSemaphore = xSemaphoreCreateBinary();
+  if (!logQueue || !logCmdAckSemaphore) {
+    Serial.println("Failed to create logging queue/semaphore. Halting.");
+    while (true) delay(1000);
+  }
+
+  // Core 0: SD writer, exclusive owner of the SD/SPI bus.
+  // Core 1: Arduino's own loop() runs here by default, handling GPS/IMU
+  // sampling -- see loop() below.
+  xTaskCreatePinnedToCore(
+      sdWriterTask, "SDWriter", 8192, nullptr, 2, &sdWriterTaskHandle, 0);
 
   GPSSerial.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
 

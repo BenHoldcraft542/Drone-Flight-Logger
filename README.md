@@ -32,7 +32,9 @@ No flight controller. No telemetry radio. Just an ESP32, a GPS module, and an IM
 ```mermaid
 flowchart TD
     A["ESP32 + GPS + IMU<br/>(idle, waiting to arm)"] -->|"press BOOT button<br/>(only honored with a valid GPS fix)"| B["Logging to flash<br/>(LittleFS, JSONL)"]
-    B -->|"land, power-cycle near WiFi"| C["Chunked HTTP POST upload<br/>(150 pts/batch, API-keyed)"]
+    B -->|"press BOOT again<br/>(stop logging)"| B2["Immediate upload attempt<br/>(WiFi still up from boot)"]
+    B -->|"or: power-cycle near WiFi"| C["Chunked HTTP POST upload<br/>(150 pts/batch, API-keyed)"]
+    B2 --> C
     C --> D["FastAPI ground station (Pi)<br/>reconstructs real UTC timestamps → SQLite"]
     D --> E["Web dashboard<br/>2D map · 3D path · HUD instruments · scrub-to-replay timeline"]
     C -.->|"next flight"| A
@@ -42,8 +44,9 @@ flowchart TD
 2. It then sits idle, waiting for the **BOOT button (GPIO0)** to arm logging — but the button only actually does anything once there's a **valid GPS fix**. The **READY_LED** communicates this live: off with no fix, slow-blinking once GPS alone is good, fast-blinking once GPS *and* the IMU are both good to go.
 3. Once armed, it logs **GPS fixes (~5 Hz)** and **IMU samples (~50 Hz)** as interleaved JSONL to onboard flash, timestamped with milliseconds-since-boot — no live clock needed in the air. A separate onboard heartbeat LED confirms data is actively being written (see [Status LEDs](#status-leds) — this replaced an earlier per-point flash that was too fast to see).
 4. Orientation (roll/pitch/yaw) is computed **on the ESP32 itself** via a quaternion-based Madgwick AHRS filter, with continuous gyro-bias learning to track thermal drift.
-5. Back near WiFi, the whole flight uploads in small batches to avoid ESP32 heap exhaustion, and the **FastAPI backend** reconstructs true UTC timestamps by anchoring each point to the batch's known first/last millisecond offsets.
-6. The **web dashboard** — served straight off the Raspberry Pi — renders the flight path on a 2D Leaflet map and a 3D Three.js scene, with a HUD of altitude/speed tapes, an attitude indicator, GPS/battery/vibration readouts, and a scrub-to-replay timeline.
+5. **Pressing BOOT a second time while a flight is being logged stops it** — logging LED off, and it tries to upload immediately over the WiFi connection that's been open since boot, rather than requiring a reboot to trigger the upload. If WiFi isn't connected at that point, it falls back to the normal "kept on flash for retry next boot" behavior (3 UPLOAD_LED flashes).
+6. Back near WiFi, the whole flight uploads in small batches to avoid ESP32 heap exhaustion, and the **FastAPI backend** reconstructs true UTC timestamps by anchoring each point to the batch's known first/last millisecond offsets.
+7. The **web dashboard** — served straight off the Raspberry Pi — renders the flight path on a 2D Leaflet map and a 3D Three.js scene, with a HUD of altitude/speed tapes, an attitude indicator, GPS/battery/vibration readouts, and a scrub-to-replay timeline.
 
 ---
 
@@ -279,11 +282,14 @@ Lessons learned the hard way, kept here so they don't get re-learned:
 - **SQLite foreign keys don't cascade by default.** `PRAGMA foreign_keys` has to be set per-connection, and the backend doesn't rely on it — flight deletion explicitly removes child rows from `telemetry_points`/`imu_points` before the parent `flights` row.
 - **`systemd`'s `User=` must match your actual account**, not an assumed default like `pi` — and `WorkingDirectory`/`ExecStart` paths need to agree with wherever the repo actually lives on the Pi.
 - **Offline field use means self-hosting everything** except map tiles — all JS/CSS ships in `frontend/vendor/` rather than pulling from a CDN.
+- **⚠️ Known issue: SQLite `database is locked` on longer flights.** A ~5 min test flight (15k+ points) failed partway through upload with HTTP `-11` (`HTTPC_ERROR_READ_TIMEOUT`) on the ESP32 side, and `journalctl` showed the backend hit `sqlite3.OperationalError: database is locked` at the same moment. Root cause: `backend/app.py` opens each request's SQLite connection with `sqlite3.connect(DB_PATH)` — no `timeout=`, and the DB isn't in WAL mode — so a write and a concurrent read/write can collide and fail immediately instead of waiting for the lock. Short flights (a few hundred points, few batches) haven't hit this; it shows up once there are enough batches in flight close together. Not yet fixed in code — see [Roadmap](#roadmap). The ESP32-side reboot immediately after the failed batch (`ets Jul 29 2019 12:21:46` in the serial log) is still unconfirmed as related — worth checking free heap across batches to rule out heap exhaustion as a separate contributing cause.
 
 ---
 
 ## Roadmap
 
+- [ ] **Fix SQLite `database is locked` on longer flights** — enable WAL mode (`PRAGMA journal_mode=WAL;`) and set a `busy_timeout`/`timeout=` on every `sqlite3.connect()` call in `backend/app.py`, and wrap batch inserts in a single transaction instead of committing per-row. Discovered on a ~5 min / 15k-point test flight; see [Design notes & gotchas](#design-notes--gotchas).
+- [ ] **Confirm/rule out ESP32 heap exhaustion during long uploads** — the board rebooted right after the failed batch above. Add a free-heap log line before each batch to see if it trends downward over a long upload; separate from the SQLite locking issue but happened in the same test.
 - [ ] **SD card storage migration** — swap `LittleFS.open()` → `SD.open()` for the flight log, using an SPI microSD breakout (candidate CS pin: **GPIO15** — GPIO33 is no longer available, it's now UPLOAD_LED). Existing JSONL logging and chunked-upload logic should carry over largely unchanged.
 - [ ] **Benchmark SD write latency** ahead of pushing IMU sampling past 50 Hz toward 100 Hz+.
 - [ ] **Offline map tiles** — the dashboard's JS/CSS is fully self-hosted, but map tiles still stream live from OpenStreetMap; no offline tile cache yet.
